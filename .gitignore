@@ -1,0 +1,111 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+*.prof
+
+# Go workspace file
+go.work
+
+# Dependency directories
+vendor/
+
+# Build directories
+build/
+_build/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+tmp/
+temp/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Configuration overrides
+config/local.yaml
+config/override.yaml
+*.local.yaml
+
+# Test coverage reports
+coverage.txt
+coverage.html
+coverage.out
+
+# Generated certificates (for testing)
+certs/*.pem
+certs/*.key
+certs/*.csr
+certs/*.srl
+!certs/README.md
+
+# OS specific
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Compiled Object files, Static and Dynamic libs
+*.o
+*.a
+
+# Folders
+_obj
+_test
+
+# Architecture specific extensions/prefixes
+*.[568vq]
+[568vq].out
+
+# cgo generated
+*.cgo1.go
+*.cgo2.c
+_cgo_defun.c
+_cgo_gotypes.go
+_cgo_export.*
+
+# Test generated files
+testdata/output/
+*.golden
+
+# Profiling data
+*.cpu
+*.mem
+*.trace
+
+# Air - Live reload for Go apps
+tmp/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Benchmarks
+benchmarks/results/
+
+# Issue templates backup (keep locally but don't commit)
+.github/ISSUE_TEMPLATE.backup/

@@ -1,0 +1,44 @@
+# SDP 生产配置 - 生产环境
+# 强化安全性，优化稳定性
+
+component:
+  type: controller
+  id: prod-controller-001
+  name: SDP Controller (Production)
+  version: 1.0.0
+
+tls:
+  cert_file: /etc/sdp/certs/prod-controller-cert.pem
+  key_file: /etc/sdp/certs/prod-controller-key.pem
+  ca_file: /etc/sdp/certs/prod-ca-cert.pem
+  min_version: TLS1.3  # 强制 TLS 1.3
+
+auth:
+  token_ttl: 1800s  # 30分钟（安全性优先）
+  device_validation: true
+  mfa_required: true  # 生产环境启用 MFA
+
+policy:
+  engine: embedded
+  endpoint: ""
+
+logging:
+  level: info
+  format: json
+  output: file  # 写入文件
+  audit_file: /var/log/sdp/audit.log
+
+transport:
+  # 标准端口
+  http_addr: :8080
+  tcp_proxy_addr: :9443
+  grpc_addr: :50051
+  
+  # 默认 HTTP+SSE 模式（可靠性最佳）
+  enable_grpc: false
+  sse_heartbeat: 30s
+  
+  # 生产级超时配置
+  read_timeout: 20s
+  write_timeout: 20s
+  idle_timeout: 90s

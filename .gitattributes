@@ -1,0 +1,60 @@
+# Set default behavior to automatically normalize line endings
+* text=auto
+
+# Go source files
+*.go text eol=lf
+
+# Shell scripts
+*.sh text eol=lf
+
+# YAML files
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Markdown files
+*.md text eol=lf
+
+# JSON files
+*.json text eol=lf
+
+# Makefile
+Makefile text eol=lf
+
+# Certificate and key files (binary)
+*.pem binary
+*.key binary
+*.crt binary
+*.der binary
+
+# Database files (binary)
+*.db binary
+*.sqlite binary
+*.sqlite3 binary
+
+# Compiled binaries (binary)
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+
+# Archives (binary)
+*.zip binary
+*.tar binary
+*.gz binary
+*.tgz binary
+*.rar binary
+
+# Images (binary)
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.gif binary
+*.ico binary
+*.svg binary
+
+# Exclude files from export
+.gitattributes export-ignore
+.gitignore export-ignore
+.editorconfig export-ignore
+.golangci.yml export-ignore
+.github/ export-ignore

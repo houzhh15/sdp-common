@@ -1,0 +1,28 @@
+component:
+  type: ih-client
+  id: ih-001
+  name: IH Client Example
+  version: 1.0.0
+
+tls:
+  cert_file: ../../certs/ih-client-cert.pem
+  key_file: ../../certs/ih-client-key.pem
+  ca_file: ../../certs/ca-cert.pem
+
+controller:
+  url: https://localhost:8443
+  tcp_proxy_addr: localhost:9443
+
+local_proxy:
+  listen_addr: localhost:8080
+
+logging:
+  level: info
+  format: json
+  output: stdout
+
+# Tunnel settings
+tunnel:
+  default_id: tunnel-12345678
+  connect_timeout: 10s
+  idle_timeout: 300s

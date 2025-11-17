@@ -1,0 +1,31 @@
+component:
+  type: controller
+  id: ctrl-001
+  name: SDP Controller Example
+  version: 1.0.0
+
+tls:
+  cert_file: ../../certs/controller-cert.pem
+  key_file: ../../certs/controller-key.pem
+  ca_file: ../../certs/ca-cert.pem
+
+auth:
+  token_ttl: 3600s
+  device_validation: false
+  mfa_required: false
+
+policy:
+  engine: embedded
+  endpoint: ""
+
+logging:
+  level: info
+  format: text
+  output: stdout
+  audit_file: ""
+
+transport:
+  http_addr: ":8443"
+  tcp_proxy_addr: ":9443"
+  sse_heartbeat: 30s
+  enable_grpc: false

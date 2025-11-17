@@ -1,0 +1,48 @@
+# SDP 默认配置 - HTTP+SSE+TCP (推荐配置)
+# 适用于所有场景，平衡性能与兼容性
+
+component:
+  type: controller  # controller, ih, ah
+  id: controller-001
+  name: SDP Controller
+  version: 1.0.0
+
+tls:
+  cert_file: /etc/sdp/certs/controller-cert.pem
+  key_file: /etc/sdp/certs/controller-key.pem
+  ca_file: /etc/sdp/certs/ca-cert.pem
+  min_version: TLS1.2
+
+auth:
+  token_ttl: 3600s  # 1小时
+  device_validation: true
+  mfa_required: false
+
+policy:
+  engine: embedded  # embedded 或 external
+  endpoint: ""
+
+logging:
+  level: info
+  format: json
+  output: stdout
+  audit_file: /var/log/sdp/audit.log
+
+transport:
+  # Control Plane: HTTP REST API (默认)
+  http_addr: :8080
+  
+  # Real-time Notification: SSE (Server-Sent Events, 默认)
+  sse_heartbeat: 30s
+  
+  # Data Plane: TCP Proxy (固定)
+  tcp_proxy_addr: :9443
+  
+  # gRPC 支持 (可选)
+  enable_grpc: false
+  grpc_addr: :50051
+  
+  # 超时配置
+  read_timeout: 15s
+  write_timeout: 15s
+  idle_timeout: 60s

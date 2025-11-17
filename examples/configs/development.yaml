@@ -1,0 +1,44 @@
+# SDP 开发配置 - 本地开发环境
+# 增强调试能力，快速迭代
+
+component:
+  type: controller
+  id: dev-controller
+  name: SDP Controller (Dev)
+  version: 1.0.0-dev
+
+tls:
+  cert_file: ./certs/dev-cert.pem
+  key_file: ./certs/dev-key.pem
+  ca_file: ./certs/ca-cert.pem
+  min_version: TLS1.2
+
+auth:
+  token_ttl: 86400s  # 24小时（开发期间减少重新认证）
+  device_validation: false  # 开发环境关闭设备验证
+  mfa_required: false
+
+policy:
+  engine: embedded
+  endpoint: ""
+
+logging:
+  level: debug  # 详细日志
+  format: text  # 可读性更好
+  output: stdout
+  audit_file: ./logs/audit.log
+
+transport:
+  # 使用非特权端口
+  http_addr: :18080
+  tcp_proxy_addr: :19443
+  grpc_addr: :15051
+  
+  # 开发模式配置
+  enable_grpc: false
+  sse_heartbeat: 10s  # 更频繁的心跳便于调试
+  
+  # 较短超时便于快速失败
+  read_timeout: 5s
+  write_timeout: 5s
+  idle_timeout: 30s

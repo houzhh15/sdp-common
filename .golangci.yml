@@ -1,0 +1,81 @@
+run:
+  timeout: 5m
+  tests: true
+  skip-dirs:
+    - bin
+    - vendor
+    - examples
+  skip-files:
+    - ".*\\.pb\\.go$"
+    - ".*_test\\.go$"
+
+linters:
+  enable:
+    - errcheck      # 检查未处理的错误
+    - gosimple      # 简化代码
+    - govet         # 官方 vet 工具
+    - ineffassign   # 检查无效赋值
+    - staticcheck   # 静态检查
+    - unused        # 检查未使用的常量、变量、函数和类型
+    - gofmt         # 检查代码格式
+    - goimports     # 检查 import 顺序
+    - misspell      # 检查拼写错误
+    - unconvert     # 检查不必要的类型转换
+    - unparam       # 检查未使用的函数参数
+    - gosec         # 安全检查
+    - exportloopref # 检查循环变量引用问题
+    - gocyclo       # 圈复杂度检查
+  disable:
+    - typecheck     # 编译器已经做了
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+    check-blank: true
+
+  govet:
+    check-shadowing: true
+    enable-all: true
+
+  gocyclo:
+    min-complexity: 15
+
+  misspell:
+    locale: US
+
+  gosec:
+    excludes:
+      - G404  # 允许使用 math/rand（非加密场景）
+
+  gofmt:
+    simplify: true
+
+  goimports:
+    local-prefixes: github.com/houzhh15/sdp-common
+
+issues:
+  exclude-rules:
+    # 排除测试文件的某些检查
+    - path: _test\.go
+      linters:
+        - gosec
+        - errcheck
+        - gocyclo
+
+    # 排除生成的文件
+    - path: \.pb\.go$
+      linters:
+        - all
+
+  # 最多显示的问题数量
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+  # 不排除新代码的问题
+  new: false
+
+output:
+  format: colored-line-number
+  print-issued-lines: true
+  print-linter-name: true
+  sort-results: true

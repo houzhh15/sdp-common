@@ -1,0 +1,963 @@
+// Package main demonstrates how to use sdp-common packages to initialize a SDP Controller
+//
+// 设计说明：参考实现 vs SDK
+// ========================================
+//
+// **当前状态**: 本文件是 SDP Controller 的**完整参考实现**（953 行）
+//
+// **为什么不是 SDK？**
+//
+// sdp-common 提供的是**公共库**而非应用框架：
+//
+// ✅ 核心包（cert, session, policy, tunnel, transport）- 可复用的低层能力
+// ✅ 接口定义（tunnel.Manager, policy.Engine 等）- 标准化的抽象
+// ✅ 协议实现（protocol, transport）- SDP 2.0 规范的基础设施
+//
+// ❌ 不提供：完整的 Controller 应用层（HTTP API 路由、业务逻辑组装）
+//
+// **为什么这样设计？**
+//
+// 1. **灵活性**: 不同组织有不同的认证机制（OAuth, SAML, LDAP）、存储后端（PostgreSQL, Redis）、API 风格（REST, GraphQL）
+// 2. **简洁性**: 避免过度抽象，保持公共库职责清晰
+// 3. **可维护性**: 应用层逻辑频繁变化，不应绑定到底层库
+//
+// **如何使用本示例？**
+//
+// 方式1（推荐）: 作为起点复制到你的项目
+//   - 复制本文件到你的项目作为 main.go
+//   - 复制 tunnel_manager.go（或实现你自己的存储后端）
+//   - 根据需求定制 HTTP API 处理器
+//   - 集成你的认证、监控、日志系统
+//
+// 方式2: 直接运行示例学习
+//   - cd examples/controller && go run .
+//   - 查看各个 SDK 包如何组合使用
+//   - 了解 SDP 2.0 协议实现细节
+//
+// **代码结构（953 行）**:
+//
+// - 行 80-210:   SDK 初始化（cert, session, policy, tunnel, transport）
+// - 行 273-700:  HTTP REST API 处理器（完整的 SDP 2.0 协议实现）
+// - 行 783-953:  辅助函数和配置
+//
+// 详细说明见：examples/controller/README.md
+//
+// **未来计划**: controller 包
+//
+// 社区反馈表明需要更高层的 SDK。我们正在开发 controller 包：
+//   - 提供开箱即用的 Controller 实现
+//   - 可插拔的认证/存储后端
+//   - 10 行代码启动生产级 Controller
+//
+// 在此之前，请使用本参考实现作为起点。
+//
+package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/houzhh15/sdp-common/cert"
+	"github.com/houzhh15/sdp-common/config"
+	"github.com/houzhh15/sdp-common/logging"
+	"github.com/houzhh15/sdp-common/policy"
+	"github.com/houzhh15/sdp-common/protocol"
+	"github.com/houzhh15/sdp-common/session"
+	"github.com/houzhh15/sdp-common/transport"
+	"github.com/houzhh15/sdp-common/tunnel"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+)
+
+var (
+	configFile = flag.String("config", "../../configs/controller.yaml", "Configuration file path")
+	certFile   = flag.String("cert", "../../certs/controller-cert.pem", "Certificate file path")
+	keyFile    = flag.String("key", "../../certs/controller-key.pem", "Private key file path")
+	caFile     = flag.String("ca", "../../certs/ca-cert.pem", "CA certificate file path")
+	addr       = flag.String("addr", ":8443", "HTTPS server address")
+	proxyAddr  = flag.String("proxy-addr", ":9443", "TCP proxy address for IH Client connections")
+	targetAddr = flag.String("target", "localhost:9999", "Target service address (for demo)")
+	logLevel   = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
+)
+
+func main() {
+	flag.Parse()
+
+	var cfg *config.Config
+	var configSource string
+
+	// Try to load configuration file
+	loader := config.NewLoader()
+	loadedCfg, err := loader.Load(*configFile)
+	if err != nil {
+		// Fallback to command line arguments
+		log.Printf("Warning: Failed to load config file '%s': %v, using command line arguments", *configFile, err)
+		cfg = buildConfigFromFlags()
+		configSource = "command line arguments"
+	} else {
+		// Validate config
+		if err := loader.Validate(loadedCfg); err != nil {
+			log.Printf("Warning: Config validation failed: %v, using command line arguments", err)
+			cfg = buildConfigFromFlags()
+			configSource = "command line arguments"
+		} else {
+			cfg = loadedCfg
+			configSource = fmt.Sprintf("file: %s", *configFile)
+		}
+	}
+
+	// 1. Initialize logger
+	logger, err := logging.NewLogger(&logging.Config{
+		Level:  cfg.Logging.Level,
+		Format: cfg.Logging.Format,
+		Output: cfg.Logging.Output,
+	})
+	if err != nil {
+		log.Fatalf("Failed to initialize logger: %v", err)
+	}
+	logger.Info("Controller starting", "version", "1.0.0-example", "config_source", configSource)
+
+	// 2. Initialize certificate manager
+	certManager, err := cert.NewManager(&cert.Config{
+		CertFile: cfg.TLS.CertFile,
+		KeyFile:  cfg.TLS.KeyFile,
+		CAFile:   cfg.TLS.CAFile,
+	})
+	if err != nil {
+		log.Fatalf("Failed to initialize cert manager: %v", err)
+	}
+	fmt.Printf("Certificate loaded, fingerprint: %s\n", certManager.GetFingerprint())
+
+	// Validate certificate
+	if err := certManager.ValidateExpiry(); err != nil {
+		log.Fatalf("Certificate validation failed: %v", err)
+	}
+
+	daysLeft := certManager.DaysUntilExpiry()
+	if daysLeft < 30 {
+		logger.Warn("Certificate expiring soon", "days_remaining", daysLeft)
+	}
+
+	// Get TLS config for servers
+	tlsConfig := certManager.GetTLSConfig()
+
+	// ============================================================================
+	// SDK 使用示例：初始化核心组件
+	// ============================================================================
+	// 以下代码展示如何使用 sdp-common 提供的 SDK 初始化各个组件
+
+	// 3. Initialize certificate registry (for storing client certificates)
+	// SDK: cert.NewRegistry() - 证书注册表（存储客户端证书）
+	db, err := gorm.Open(sqlite.Open("controller.db"), &gorm.Config{})
+	if err != nil {
+		log.Fatalf("Failed to open database: %v", err)
+	}
+
+	certRegistry, err := cert.NewRegistry(db, logger)
+	if err != nil {
+		log.Fatalf("Failed to initialize cert registry: %v", err)
+	}
+
+	// 4. Initialize session manager (for Token management)
+	// SDK: session.NewManager() - 会话管理（Token 生成和验证）
+	sessionManager := session.NewManager(&session.Config{
+		TokenTTL:        cfg.Auth.TokenTTL,
+		CleanupInterval: 300 * time.Second,
+	}, logger)
+	logger.Info("Session manager initialized", "token_ttl", cfg.Auth.TokenTTL)
+
+	// 5. Initialize policy engine (for access control)
+	// SDK: policy.NewEngine() - 策略引擎（访问控制决策）
+	policyStorage, err := policy.NewDBStorage(db)
+	if err != nil {
+		log.Fatalf("Failed to initialize policy storage: %v", err)
+	}
+	policyEvaluator := &policy.DefaultEvaluator{}
+	policyEngine, err := policy.NewEngine(&policy.Config{
+		Storage:   policyStorage,
+		Evaluator: policyEvaluator,
+		Logger:    logger,
+	})
+	if err != nil {
+		log.Fatalf("Failed to initialize policy engine: %v", err)
+	}
+
+	// Seed example policy for demonstration
+	err = seedExamplePolicies(policyStorage, logger)
+	if err != nil {
+		logger.Warn("Failed to seed example policies", "error", err)
+	}
+	logger.Info("Policy engine initialized")
+
+	// 6. Initialize tunnel manager (for tunnel lifecycle management)
+	tunnelManager := NewInMemoryTunnelManager(logger)
+	logger.Info("Tunnel manager initialized")
+
+	// Seed example service configurations (SDP 2.0 规范 0x04 消息)
+	err = seedExampleServices(tunnelManager, logger, *targetAddr)
+	if err != nil {
+		logger.Warn("Failed to seed example services", "error", err)
+	}
+	logger.Info("Example services seeded")
+
+	// 7. Initialize tunnel notifier (SSE push for AH agents)
+	tunnelNotifier := tunnel.NewNotifier(logger, cfg.Transport.SSEHeartbeat)
+
+	logger.Info("Components initialized successfully")
+
+	// ==== step-07: TCP Proxy Refactoring with transport.TCPProxyServer ====
+
+	// Create tunnel store adapter
+	tunnelStore := NewTunnelStoreAdapter(tunnelManager)
+
+	// Create TCP proxy server using transport package
+	tcpProxyConfig := &transport.TCPProxyConfig{
+		BufferSize:     32 * 1024,
+		ConnectTimeout: 5 * time.Second,
+		ReadTimeout:    30 * time.Second,
+		WriteTimeout:   30 * time.Second,
+		MaxConnections: 10000,
+	}
+	tcpProxyServer := transport.NewTCPProxyServer(tunnelStore, logger, tcpProxyConfig)
+
+	// Start TCP proxy with TLS support in goroutine
+	go func() {
+		logger.Info("Starting TLS TCP Proxy", "addr", cfg.Transport.TCPProxyAddr)
+
+		// Create TLS listener for TCP proxy (mTLS required)
+		tlsListener, err := tls.Listen("tcp", cfg.Transport.TCPProxyAddr, tlsConfig)
+		if err != nil {
+			logger.Error("Failed to create TLS listener for TCP proxy", "error", err)
+			return
+		}
+		defer tlsListener.Close()
+
+		logger.Info("TLS TCP Proxy started", "addr", cfg.Transport.TCPProxyAddr)
+
+		// Accept connections loop
+		for {
+			conn, err := tlsListener.Accept()
+			if err != nil {
+				logger.Error("Failed to accept connection", "error", err)
+				continue
+			}
+
+			// Handle each connection in goroutine using tcpProxyServer
+			go func(c net.Conn) {
+				if err := tcpProxyServer.HandleConnection(c); err != nil {
+					logger.Error("TCP Proxy connection error", "error", err)
+				}
+			}(conn)
+		}
+	}()
+
+	// ============================================================================
+	// HTTP REST API 实现示例
+	// ============================================================================
+	// 以下代码展示如何实现 SDP 2.0 规范的 REST API 端点
+	// 注意：这些是 **示例实现**，生产环境可根据需求定制
+	//
+	// 为什么不在 SDK 中提供？
+	// - 不同实现可能需要不同的认证机制（OAuth, SAML等）
+	// - 不同的存储后端（内存、Redis、PostgreSQL）
+	// - 自定义的业务逻辑和响应格式
+	//
+	// 开发者可以：
+	// - 直接使用这些处理器（复制到自己的项目）
+	// - 根据需求修改和扩展
+	// - 集成到自己的 Web 框架（Gin, Echo等）
+
+	// 6. Setup HTTP server with example endpoints
+	mux := http.NewServeMux()
+
+	// Health check endpoint
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "OK")
+	})
+
+	// Handshake endpoint - creates session and returns token
+	mux.HandleFunc("/api/v1/handshake", func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+
+		// Extract client certificate
+		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+			respondError(w, protocol.ErrCodeInvalidCert, "No client certificate", nil)
+			return
+		}
+
+		clientCert := r.TLS.PeerCertificates[0]
+
+		// Calculate fingerprint
+		hash := sha256.Sum256(clientCert.Raw)
+		fingerprint := "sha256:" + hex.EncodeToString(hash[:])
+
+		logger.Info("Handshake request received", "fingerprint", fingerprint)
+
+		// Validate certificate
+		if err := certRegistry.Validate(fingerprint); err != nil {
+			// If not registered, register it
+			clientID := fmt.Sprintf("client-%d", time.Now().Unix())
+			if err := certRegistry.Register(clientID, fingerprint, clientCert); err != nil {
+				logger.Error("Failed to register certificate", "error", err)
+				respondError(w, protocol.ErrCodeInvalidCert, "Certificate registration failed", nil)
+				return
+			}
+		}
+
+		// step-04: Demonstrate policy evaluation during handshake
+		clientID := extractClientID(clientCert)
+
+		// Example: Evaluate access to a demo service (optional demonstration)
+		// In production, this might be called during tunnel creation
+		allowed, err := policyEngine.EvaluateAccess(ctx, &policy.AccessRequest{
+			ClientID:  clientID,
+			ServiceID: "demo-service-001",
+			Timestamp: time.Now(),
+		})
+		if err != nil {
+			logger.Warn("Policy evaluation warning", "client_id", clientID, "error", err)
+			// Continue handshake even if evaluation fails (demo behavior)
+		} else {
+			logger.Info("Policy evaluation result", "client_id", clientID, "allowed", allowed)
+		}
+
+		// Create session using session manager
+		sess, err := sessionManager.CreateSession(ctx, &session.CreateSessionRequest{
+			ClientID:        clientID,
+			CertFingerprint: fingerprint,
+			Metadata:        map[string]interface{}{"source_ip": r.RemoteAddr, "policy_check": allowed},
+		})
+		if err != nil {
+			logger.Error("Failed to create session", "error", err)
+			respondError(w, protocol.ErrCodeUnauthorized, "Session creation failed", nil)
+			return
+		}
+
+		logger.Info("Session created", "client_id", sess.ClientID, "token", sess.Token[:16]+"...")
+
+		// Return session token
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"type":          protocol.MsgTypeHandshakeResp,
+			"status":        "success",
+			"session_token": sess.Token,
+			"expires_at":    sess.ExpiresAt.Format(time.RFC3339),
+		})
+	})
+
+	// Session refresh endpoint
+	mux.HandleFunc("/api/v1/sessions/refresh", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx := r.Context()
+
+		// Extract token from Authorization header
+		token := extractBearerToken(r)
+		if token == "" {
+			respondError(w, protocol.ErrCodeUnauthorized, "Missing authorization token", nil)
+			return
+		}
+
+		// Refresh session
+		sess, err := sessionManager.RefreshSession(ctx, token)
+		if err != nil {
+			logger.Warn("Session refresh failed", "error", err, "token", token[:16]+"...")
+			respondError(w, protocol.ErrCodeSessionExpired, "Session refresh failed", nil)
+			return
+		}
+
+		logger.Info("Session refreshed", "client_id", sess.ClientID, "token", sess.Token[:16]+"...")
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":        "success",
+			"session_token": sess.Token,
+			"expires_at":    sess.ExpiresAt.Format(time.RFC3339),
+		})
+	})
+
+	// Session revoke endpoint
+	mux.HandleFunc("/api/v1/sessions/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx := r.Context()
+
+		// Extract token from URL path
+		token := strings.TrimPrefix(r.URL.Path, "/api/v1/sessions/")
+		if token == "" {
+			respondError(w, protocol.ErrCodeUnauthorized, "Missing session token", nil)
+			return
+		}
+
+		// Revoke session
+		err := sessionManager.RevokeSession(ctx, token)
+		if err != nil {
+			logger.Warn("Session revoke failed", "error", err, "token", token[:16]+"...")
+			respondError(w, protocol.ErrCodeSessionExpired, "Session not found", nil)
+			return
+		}
+
+		logger.Info("Session revoked", "token", token[:16]+"...")
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "success",
+		})
+	})
+
+	// Tunnel events SSE endpoint (for AH Agent subscription)
+	mux.HandleFunc("/v1/agent/tunnels/stream", func(w http.ResponseWriter, r *http.Request) {
+		agentID := r.URL.Query().Get("agent_id")
+		if agentID == "" {
+			agentID = "unknown"
+		}
+
+		logger.Info("SSE connection request", "agent_id", agentID, "client", r.RemoteAddr)
+
+		// Use tunnel notifier to handle SSE
+		if err := tunnelNotifier.Subscribe(agentID, w); err != nil {
+			logger.Error("Failed to subscribe", "error", err)
+			http.Error(w, "Subscription failed", http.StatusInternalServerError)
+			return
+		}
+
+		// Unsubscribe when connection closes
+		defer tunnelNotifier.Unsubscribe(agentID)
+	})
+
+	// ==== step-04: Policy Management Endpoints ====
+
+	// GET /api/v1/policies - Query policies for authenticated client
+	mux.HandleFunc("/api/v1/policies", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx := r.Context()
+
+		// Extract and validate session token
+		token := extractBearerToken(r)
+		if token == "" {
+			respondError(w, protocol.ErrCodeUnauthorized, "Missing authorization token", nil)
+			return
+		}
+
+		// Validate session to get client ID
+		sess, err := sessionManager.ValidateSession(ctx, token)
+		if err != nil {
+			logger.Warn("Session validation failed", "error", err)
+			respondError(w, protocol.ErrCodeSessionExpired, "Invalid or expired session", nil)
+			return
+		}
+
+		// Get policies for this client
+		policies, err := policyEngine.GetPoliciesForClient(ctx, sess.ClientID)
+		if err != nil {
+			logger.Error("Failed to get policies", "client_id", sess.ClientID, "error", err)
+			respondError(w, protocol.ErrCodeServiceUnavail, "Failed to retrieve policies", nil)
+			return
+		}
+
+		logger.Info("Policies retrieved", "client_id", sess.ClientID, "count", len(policies))
+
+		// Return policies
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"type":     protocol.MsgTypePolicyResp,
+			"status":   "success",
+			"policies": policies,
+		})
+	})
+
+	// ==== Service Configuration Management (SDP 2.0 规范 0x04 消息支持) ====
+	// 混合方案：HTTP GET（初始加载）+ SSE Push（实时更新）
+
+	// GET /api/v1/services - List all service configurations
+	mux.HandleFunc("/api/v1/services", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx := r.Context()
+
+		// 获取所有服务配置
+		configs, err := tunnelManager.ListServiceConfigs(ctx, "")
+		if err != nil {
+			logger.Error("Failed to list service configs", "error", err)
+			respondError(w, protocol.ErrCodeServiceUnavail, "Failed to retrieve service configs", nil)
+			return
+		}
+
+		logger.Info("Service configs listed", "count", len(configs))
+
+		// Return service configs
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":   "success",
+			"services": configs,
+			"count":    len(configs),
+		})
+	})
+
+	// GET /api/v1/services/{id} - Get single service configuration
+	mux.HandleFunc("/api/v1/services/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx := r.Context()
+
+		// Extract service ID from URL
+		serviceID := strings.TrimPrefix(r.URL.Path, "/api/v1/services/")
+		if serviceID == "" {
+			respondError(w, protocol.ErrCodeInvalidRequest, "Service ID is required", nil)
+			return
+		}
+
+		// Get service config
+		config, err := tunnelManager.GetServiceConfig(ctx, serviceID)
+		if err != nil {
+			logger.Warn("Service config not found", "service_id", serviceID, "error", err)
+			respondError(w, protocol.ErrCodeNotFound, fmt.Sprintf("Service not found: %s", serviceID), nil)
+			return
+		}
+
+		logger.Info("Service config retrieved", "service_id", serviceID)
+
+		// Return service config
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "success",
+			"service": config,
+		})
+	})
+
+	// ==== step-05: Tunnel Management Endpoints ====
+
+	// POST /api/v1/tunnels - Create tunnel
+	mux.HandleFunc("/api/v1/tunnels", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			ctx := r.Context()
+
+			// Extract and validate session token
+			token := extractBearerToken(r)
+			if token == "" {
+				respondError(w, protocol.ErrCodeUnauthorized, "Missing authorization token", nil)
+				return
+			}
+
+			sess, err := sessionManager.ValidateSession(ctx, token)
+			if err != nil {
+				respondError(w, protocol.ErrCodeSessionExpired, "Invalid or expired session", nil)
+				return
+			}
+
+			// Parse request body
+			var req struct {
+				ServiceID string `json:"service_id"`
+				LocalPort int    `json:"local_port"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				respondError(w, protocol.ErrCodeUnauthorized, "Invalid request body", nil)
+				return
+			}
+
+			// Per SDP 2.0: Set AH endpoint to TCP Proxy address (not target service)
+			// AH Agent will connect to TCP Proxy, not IH directly connects to target
+			proxyHost, proxyPortStr, _ := net.SplitHostPort(cfg.Transport.TCPProxyAddr)
+			if proxyHost == "" || proxyHost == ":" {
+				proxyHost = "localhost"
+			}
+			proxyPort, _ := strconv.Atoi(strings.TrimPrefix(proxyPortStr, ":"))
+
+			// Create tunnel using tunnel manager
+			// Per SDP 2.0 规范：TargetHost/Port 从 ServiceConfig 获取
+			tun, err := tunnelManager.CreateTunnel(ctx, &tunnel.CreateTunnelRequest{
+				SessionToken: token,
+				ClientID:     sess.ClientID,
+				ServiceID:    req.ServiceID,
+				Protocol:     "tcp",
+				TTL:          3600,
+				Metadata: map[string]interface{}{
+					"ah_endpoint": fmt.Sprintf("%s:%d", proxyHost, proxyPort),
+				},
+			})
+			if err != nil {
+				logger.Error("Failed to create tunnel", "client_id", sess.ClientID, "error", err)
+				respondError(w, protocol.ErrCodeServiceUnavail, fmt.Sprintf("Tunnel creation failed: %v", err), nil)
+				return
+			}
+
+			// Per SDP 2.0 Spec: Notify AH Agent via SSE (Step 3 in Access Workflow)
+			// Controller instructs the AHs to accept communication from the IH
+			tunnelEvent := &tunnel.TunnelEvent{
+				Type:      tunnel.EventTypeCreated, // Use constant instead of hardcoded string
+				Timestamp: time.Now(),
+				Tunnel:    tun,
+			}
+
+			// Broadcast to all connected AH agents (in production, would target specific agent)
+			if err := tunnelNotifier.Notify(tunnelEvent); err != nil {
+				logger.Warn("Failed to notify AH agents", "tunnel_id", tun.ID, "error", err)
+				// Continue anyway - this is not fatal
+			} else {
+				logger.Info("Notified AH agents", "tunnel_id", tun.ID)
+			}
+
+			logger.Info("Tunnel created", "tunnel_id", tun.ID, "client_id", sess.ClientID, "service_id", req.ServiceID)
+
+			// 获取目标地址（从 Metadata）
+			targetHost, _ := tun.Metadata["target_host"].(string)
+			targetPort, _ := tun.Metadata["target_port"].(int)
+
+			// Return tunnel details to IH (Step 4 in Access Workflow)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"type":        protocol.MsgTypeTunnelResp,
+				"status":      "success",
+				"tunnel_id":   tun.ID,
+				"target_host": targetHost,
+				"target_port": targetPort,
+				"expires_at":  tun.ExpiresAt.Format(time.RFC3339),
+			})
+
+		case http.MethodGet:
+			// List tunnels for authenticated client
+			ctx := r.Context()
+
+			token := extractBearerToken(r)
+			if token == "" {
+				respondError(w, protocol.ErrCodeUnauthorized, "Missing authorization token", nil)
+				return
+			}
+
+			sess, err := sessionManager.ValidateSession(ctx, token)
+			if err != nil {
+				respondError(w, protocol.ErrCodeSessionExpired, "Invalid or expired session", nil)
+				return
+			}
+
+			// List tunnels for this client
+			tunnels, err := tunnelManager.ListTunnels(ctx, &tunnel.TunnelFilter{
+				ClientID: sess.ClientID,
+			})
+			if err != nil {
+				logger.Error("Failed to list tunnels", "client_id", sess.ClientID, "error", err)
+				respondError(w, protocol.ErrCodeServiceUnavail, "Failed to retrieve tunnels", nil)
+				return
+			}
+
+			logger.Info("Tunnels listed", "client_id", sess.ClientID, "count", len(tunnels))
+
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"type":    "tunnel_list",
+				"status":  "success",
+				"tunnels": tunnels,
+			})
+
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	// DELETE /api/v1/tunnels/{tunnel_id} - Close tunnel
+	mux.HandleFunc("/api/v1/tunnels/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx := r.Context()
+
+		// Extract tunnel ID from URL path
+		tunnelID := strings.TrimPrefix(r.URL.Path, "/api/v1/tunnels/")
+		if tunnelID == "" {
+			respondError(w, protocol.ErrCodeUnauthorized, "Missing tunnel ID", nil)
+			return
+		}
+
+		// Validate session
+		token := extractBearerToken(r)
+		if token == "" {
+			respondError(w, protocol.ErrCodeUnauthorized, "Missing authorization token", nil)
+			return
+		}
+
+		_, err := sessionManager.ValidateSession(ctx, token)
+		if err != nil {
+			respondError(w, protocol.ErrCodeSessionExpired, "Invalid or expired session", nil)
+			return
+		}
+
+		// Delete tunnel
+		if err := tunnelManager.DeleteTunnel(ctx, tunnelID); err != nil {
+			logger.Error("Failed to delete tunnel", "tunnel_id", tunnelID, "error", err)
+			respondError(w, protocol.ErrCodeServiceUnavail, "Tunnel deletion failed", nil)
+			return
+		}
+
+		logger.Info("Tunnel deleted", "tunnel_id", tunnelID)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"type":   "tunnel_delete",
+			"status": "success",
+		})
+	})
+
+	// ==== step-06: HTTP Server Refactoring with transport.HTTPServer ====
+
+	// Create HTTP server using transport package
+	httpServer := transport.NewHTTPServer(tlsConfig)
+
+	// Register logging middleware (simple implementation)
+	httpServer.RegisterMiddleware(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			logger.Info("HTTP request", "method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
+			next.ServeHTTP(w, r)
+			logger.Info("HTTP response", "method", r.Method, "path", r.URL.Path, "duration", time.Since(start))
+		})
+	})
+
+	// Start server in goroutine
+	go func() {
+		logger.Info("Starting HTTPS server", "addr", cfg.Transport.HTTPAddr)
+		if err := httpServer.Start(cfg.Transport.HTTPAddr, mux); err != nil {
+			log.Fatalf("Failed to start HTTP server: %v", err)
+		}
+	}()
+
+	fmt.Printf("\n✅ Controller started successfully!\n")
+	fmt.Printf("   HTTPS Server: https://localhost%s\n", cfg.Transport.HTTPAddr)
+	fmt.Printf("   TCP Proxy:    localhost%s (for IH Client)\n", cfg.Transport.TCPProxyAddr)
+	fmt.Printf("   Health Check: https://localhost%s/health\n", cfg.Transport.HTTPAddr)
+	fmt.Printf("   Press Ctrl+C to stop\n\n")
+
+	// Wait for interrupt signal
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	<-sigChan
+
+	// Graceful shutdown
+	logger.Info("Shutting down controller...")
+
+	// Stop TCP proxy
+	if err := tcpProxyServer.Stop(); err != nil {
+		logger.Error("TCP Proxy shutdown error", "error", err)
+	}
+
+	if err := httpServer.Stop(); err != nil {
+		logger.Error("HTTP server shutdown error", "error", err)
+	}
+
+	logger.Info("Controller stopped")
+}
+
+// Helper functions// buildConfigFromFlags creates a Config from command line flags (fallback when config file is not available)
+func buildConfigFromFlags() *config.Config {
+	return &config.Config{
+		Component: config.ComponentConfig{
+			Type:    "controller",
+			ID:      "ctrl-001",
+			Name:    "SDP Controller Example",
+			Version: "1.0.0",
+		},
+		TLS: config.TLSConfig{
+			CertFile: *certFile,
+			KeyFile:  *keyFile,
+			CAFile:   *caFile,
+		},
+		Auth: config.AuthConfig{
+			TokenTTL:         3600 * time.Second,
+			DeviceValidation: false,
+			MFARequired:      false,
+		},
+		Policy: config.PolicyConfig{
+			Engine:   "embedded",
+			Endpoint: "",
+		},
+		Logging: config.LoggingConfig{
+			Level:  *logLevel,
+			Format: "text",
+			Output: "stdout",
+		},
+		Transport: config.TransportConfig{
+			HTTPAddr:     *addr,
+			TCPProxyAddr: *proxyAddr,
+			SSEHeartbeat: 30 * time.Second,
+			EnableGRPC:   false,
+		},
+	}
+}
+
+// seedExamplePolicies adds example policies to the database for demonstration
+func seedExamplePolicies(storage policy.Storage, logger logging.Logger) error {
+	ctx := context.Background()
+
+	// Create an example policy for client "ih-client" to access "demo-service-001"
+	examplePolicy := &policy.Policy{
+		PolicyID:         "policy-001",
+		ClientID:         "ih-client",        // 匹配 IH Client 证书的 CommonName
+		ServiceID:        "demo-service-001", // 与 ServiceConfig 一致
+		TargetHost:       "localhost",
+		TargetPort:       8080,
+		BandwidthLimit:   1000, // 1000 kbps
+		ConcurrencyLimit: 10,
+		ExpiryTime:       time.Now().Add(365 * 24 * time.Hour), // Valid for 1 year
+		Conditions:       []*policy.Condition{},
+	}
+
+	// Check if policy already exists and needs update
+	existing, err := storage.GetPolicy(ctx, examplePolicy.PolicyID)
+	if err == nil && existing != nil {
+		// Update if ClientID is different (migration from old examples)
+		if existing.ClientID != examplePolicy.ClientID {
+			logger.Info("Updating example policy with new ClientID",
+				"policy_id", examplePolicy.PolicyID,
+				"old_client_id", existing.ClientID,
+				"new_client_id", examplePolicy.ClientID)
+			// Delete old policy first
+			if err := storage.DeletePolicy(ctx, examplePolicy.PolicyID); err != nil {
+				return fmt.Errorf("failed to delete old policy: %w", err)
+			}
+		} else {
+			logger.Info("Example policy already exists", "policy_id", examplePolicy.PolicyID)
+			return nil
+		}
+	}
+
+	// Save the example policy
+	if err := storage.SavePolicy(ctx, examplePolicy); err != nil {
+		return fmt.Errorf("failed to save example policy: %w", err)
+	}
+
+	logger.Info("Example policy seeded", "policy_id", examplePolicy.PolicyID, "client_id", examplePolicy.ClientID, "service_id", examplePolicy.ServiceID)
+	return nil
+}
+
+// seedExampleServices seeds example service configurations (SDP 2.0 规范 0x04 消息)
+func seedExampleServices(manager tunnel.Manager, logger logging.Logger, targetAddr string) error {
+	ctx := context.Background()
+
+	// Parse target address
+	host, portStr, err := net.SplitHostPort(targetAddr)
+	if err != nil {
+		return fmt.Errorf("invalid target address format: %w", err)
+	}
+	targetPort, err := strconv.Atoi(portStr)
+	if err != nil {
+		return fmt.Errorf("invalid port: %w", err)
+	}
+
+	// Create example service configuration
+	exampleService := &tunnel.ServiceConfig{
+		ServiceID:   "demo-service-001",
+		ServiceName: "Demo Web Service",
+		TargetHost:  host,
+		TargetPort:  targetPort,
+		Protocol:    "tcp",
+		Description: "Example web service for testing",
+		Status:      tunnel.ServiceStatusActive,
+	}
+
+	if err := manager.CreateServiceConfig(ctx, exampleService); err != nil {
+		return fmt.Errorf("failed to create example service: %w", err)
+	}
+
+	logger.Info("Example service seeded",
+		"service_id", exampleService.ServiceID,
+		"target", fmt.Sprintf("%s:%d", exampleService.TargetHost, exampleService.TargetPort))
+	return nil
+}
+
+// respondError sends a standardized error response using protocol.Error
+func respondError(w http.ResponseWriter, code int, message string, details map[string]interface{}) {
+	err := protocol.NewError(code, message)
+	if details != nil {
+		for k, v := range details {
+			err.WithDetails(k, v)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(getHTTPStatusCode(code))
+	json.NewEncoder(w).Encode(err)
+}
+
+// getHTTPStatusCode converts protocol error code to HTTP status code
+func getHTTPStatusCode(code int) int {
+	switch {
+	case code >= 40100 && code < 40200:
+		return http.StatusUnauthorized
+	case code >= 40300 && code < 40400:
+		return http.StatusForbidden
+	case code >= 40400 && code < 40500:
+		return http.StatusNotFound
+	case code >= 40900 && code < 41000:
+		return http.StatusConflict
+	case code >= 50300 && code < 50400:
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+// extractClientID extracts a client ID from certificate subject
+func extractClientID(cert *x509.Certificate) string {
+	// Try to extract from CommonName
+	if cert.Subject.CommonName != "" {
+		return cert.Subject.CommonName
+	}
+	// Fallback to generating from serial number
+	return fmt.Sprintf("client-%s", cert.SerialNumber.String())
+}
+
+// extractBearerToken extracts the Bearer token from Authorization header
+func extractBearerToken(r *http.Request) string {
+	auth := r.Header.Get("Authorization")
+	if auth == "" {
+		return ""
+	}
+	parts := strings.SplitN(auth, " ", 2)
+	if len(parts) != 2 || parts[0] != "Bearer" {
+		return ""
+	}
+	return parts[1]
+}

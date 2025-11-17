@@ -1,0 +1,42 @@
+# 将提交到 GitHub 的文件清单
+# 生成时间: 2025-11-17
+
+## 配置文件 (7个)
+.editorconfig
+.gitattributes
+.gitignore
+.golangci.yml
+Makefile
+VERSION
+go.mod
+
+## 文档文件 (5个)
+ARCHITECTURE.md
+CHANGELOG.md
+LICENSE
+README.md
+SECURITY.md
+
+## GitHub 配置 (1个)
+.github/workflows/ci.yml
+
+## 脚本工具 (1个)
+quickstart.sh
+
+## 证书说明 (1个)
+certs/README.md
+
+## 总结文档 (2个 - 可选)
+READY_TO_COMMIT.md
+COMMIT_SUMMARY.md
+
+## 不会提交的文件（已忽略）
+# .github/ISSUE_TEMPLATE.backup/ - Issue模板备份（本地保留）
+# bin/ - 编译产物
+# certs/*.pem, certs/*.key - 测试证书
+# *.log - 日志文件
+# coverage.* - 测试覆盖率报告
+
+---
+核心文件数: 约 15 个
+适用场景: 实验性项目，简化配置
