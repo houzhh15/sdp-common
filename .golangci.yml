@@ -25,8 +25,6 @@ linters:
     - gosec         # 安全检查
     - exportloopref # 检查循环变量引用问题
     - gocyclo       # 圈复杂度检查
-  disable:
-    - typecheck     # 编译器已经做了
 
 linters-settings:
   errcheck:
