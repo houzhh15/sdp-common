@@ -12,10 +12,10 @@ import (
 // mockLogger 模拟日志记录器
 type mockLogger struct{}
 
-func (l *mockLogger) Info(msg string, fields map[string]interface{})             {}
-func (l *mockLogger) Warn(msg string, fields map[string]interface{})             {}
-func (l *mockLogger) Error(msg string, err error, fields map[string]interface{}) {}
-func (l *mockLogger) Debug(msg string, fields map[string]interface{})            {}
+func (l *mockLogger) Info(msg string, fields ...interface{})  {}
+func (l *mockLogger) Warn(msg string, fields ...interface{})  {}
+func (l *mockLogger) Error(msg string, fields ...interface{}) {}
+func (l *mockLogger) Debug(msg string, fields ...interface{}) {}
 
 // setupTestDB 创建测试数据库
 func setupTestDB(t *testing.T) *gorm.DB {
