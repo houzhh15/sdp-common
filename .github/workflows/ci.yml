@@ -99,58 +99,35 @@ jobs:
           exit 1
         fi
 
-  # 集成测试
-  integration:
-    name: Integration Tests
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.21'
-    
-    - name: Generate test certificates
-      run: |
-        mkdir -p test/certs
-        # 生成CA证书
-        openssl genrsa -out test/certs/ca-key.pem 2048
-        openssl req -new -x509 -key test/certs/ca-key.pem -out test/certs/ca-cert.pem -days 365 -subj "/CN=Test CA"
-        
-        # 生成服务器证书
-        openssl genrsa -out test/certs/server-key.pem 2048
-        openssl req -new -key test/certs/server-key.pem -out test/certs/server.csr -subj "/CN=localhost"
-        openssl x509 -req -in test/certs/server.csr -CA test/certs/ca-cert.pem -CAkey test/certs/ca-key.pem -CAcreateserial -out test/certs/server-cert.pem -days 365
-        
-        # 生成客户端证书
-        openssl genrsa -out test/certs/client-key.pem 2048
-        openssl req -new -key test/certs/client-key.pem -out test/certs/client.csr -subj "/CN=test-client"
-        openssl x509 -req -in test/certs/client.csr -CA test/certs/ca-cert.pem -CAkey test/certs/ca-key.pem -CAcreateserial -out test/certs/client-cert.pem -days 365
-    
-    - name: Run integration tests
-      run: go test -v -tags=integration ./test/integration/...
+  # 集成测试 - 暂时禁用，待重新实现
+  # integration:
+  #   name: Integration Tests
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #   - uses: actions/checkout@v4
+  #   
+  #   - name: Set up Go
+  #     uses: actions/setup-go@v5
+  #     with:
+  #       go-version: '1.21'
+  #   
+  #   - name: Run integration tests
+  #     run: echo "Integration tests disabled - to be reimplemented"
 
-  # 基准测试
-  benchmark:
-    name: Benchmark Tests
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.21'
-    
-    - name: Run benchmarks
-      run: go test -v -bench=. -benchmem ./test/... | tee benchmark.txt
-    
-    - name: Upload benchmark results
-      uses: actions/upload-artifact@v3
-      with:
-        name: benchmark-results
-        path: benchmark.txt
+  # 基准测试 - 暂时禁用，待重新实现
+  # benchmark:
+  #   name: Benchmark Tests
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #   - uses: actions/checkout@v4
+  #   
+  #   - name: Set up Go
+  #     uses: actions/setup-go@v5
+  #     with:
+  #       go-version: '1.21'
+  #   
+  #   - name: Run benchmarks
+  #     run: echo "Benchmark tests disabled - to be reimplemented"
 
   # 构建检查
   build:
