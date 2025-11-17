@@ -29,7 +29,7 @@ func TestNewError(t *testing.T) {
 func TestWrapError(t *testing.T) {
 	originalErr := errors.New("connection refused")
 	err := WrapError(ErrCodeServiceUnavail, originalErr)
-	
+
 	if err.Code != ErrCodeServiceUnavail {
 		t.Errorf("Code = %d, want %d", err.Code, ErrCodeServiceUnavail)
 	}
@@ -42,7 +42,7 @@ func TestError_WithDetails(t *testing.T) {
 	err := NewError(ErrCodeUnauthorized, "access denied").
 		WithDetails("client_id", "ih-001").
 		WithDetails("reason", "invalid_token")
-	
+
 	if err.Details["client_id"] != "ih-001" {
 		t.Error("client_id detail not set correctly")
 	}

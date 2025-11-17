@@ -1,6 +1,6 @@
 package session
 
-import(
+import (
 	"context"
 	"sync"
 	"testing"
@@ -10,10 +10,10 @@ import(
 // mockLogger 模拟日志记录器
 type mockLogger struct{}
 
-func (l *mockLogger) Info(msg string, fields map[string]interface{})  {}
-func (l *mockLogger) Warn(msg string, fields map[string]interface{})  {}
+func (l *mockLogger) Info(msg string, fields map[string]interface{})             {}
+func (l *mockLogger) Warn(msg string, fields map[string]interface{})             {}
 func (l *mockLogger) Error(msg string, err error, fields map[string]interface{}) {}
-func (l *mockLogger) Debug(msg string, fields map[string]interface{}) {}
+func (l *mockLogger) Debug(msg string, fields map[string]interface{})            {}
 
 // TestCreateSession 测试会话创建
 func TestCreateSession(t *testing.T) {
