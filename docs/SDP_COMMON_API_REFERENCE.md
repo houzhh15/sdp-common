@@ -1386,9 +1386,9 @@ type Notifier interface {
 // TunnelEvent - 隧道事件
 type TunnelEvent struct {
     Type      EventType              // created, updated, deleted
-    Tunnel    *Tunnel
-    Timestamp time.Time
-    Metadata  map[string]interface{}
+    Tunnel    *Tunnel                // 隧道对象（包含 ID、ServiceID 等基本信息）
+    Timestamp time.Time              // 事件时间戳
+    Details   map[string]interface{} // 事件详情（例如：controller_addr - Controller 数据平面地址）
 }
 
 type EventType string
@@ -1400,6 +1400,21 @@ const (
 
 // ServiceEvent - 服务配置事件（已在 5.2 ServiceConfig 部分定义）
 ```
+
+**重要说明 - Controller 数据平面地址传递**:
+
+> **✨ 架构设计** (2025-11-19): Controller 通过 `event.Details["controller_addr"]` 传递数据平面地址
+
+当 Controller 创建隧道时，会在 SSE 事件的 `Details` 字段中包含 `controller_addr`，指示 IH Client 和 AH Agent 连接到 Controller 的数据平面中继服务器（TunnelRelayServer）。
+
+**字段优先级**（AH Agent 端获取 Controller 地址）:
+1. **最高优先级**: `event.Details["controller_addr"]` - Controller 推送的动态地址
+2. **次优先级**: `event.Tunnel.Metadata["ah_endpoint"]` - 隧道元数据中的端点
+3. **兜底方案**: `event.Tunnel.AHEndpoint` - 隧道对象的 AH 端点字段
+
+**推荐做法**:
+- Controller 端：在 `handleTunnelCreate` 中设置 `event.Details["controller_addr"]`
+- AH Agent 端：优先从 `event.Details` 获取，支持多级 fallback
 
 **使用示例 - 隧道事件推送**:
 
@@ -1423,6 +1438,9 @@ http.HandleFunc("/api/v1/tunnels/stream", func(w http.ResponseWriter, r *http.Re
 err := notifier.Notify(&tunnel.TunnelEvent{
     Type:   tunnel.EventTypeCreated,
     Tunnel: newTunnel,
+    Details: map[string]interface{}{
+        "controller_addr": "localhost:9443", // Controller 数据平面地址（IH 和 AH 连接地址）
+    },
 })
 
 // 发送给特定客户端（单播）
@@ -1526,8 +1544,29 @@ for event := range subscriber.Events() {
     switch event.Type {
     case tunnel.EventTypeCreated:
         log.Printf("新隧道创建: %s", event.Tunnel.ID)
-        // 建立数据平面连接
-        handleNewTunnel(event.Tunnel)
+        
+        // 从 event.Details 获取 Controller 数据平面地址
+        var controllerAddr string
+        if event.Details != nil {
+            if addr, ok := event.Details["controller_addr"].(string); ok {
+                controllerAddr = addr
+            }
+        }
+        
+        // Fallback: 从 Tunnel.Metadata 或 Tunnel.AHEndpoint 获取
+        if controllerAddr == "" && event.Tunnel.Metadata != nil {
+            if endpoint, ok := event.Tunnel.Metadata["ah_endpoint"].(string); ok {
+                controllerAddr = endpoint
+            }
+        }
+        if controllerAddr == "" {
+            controllerAddr = event.Tunnel.AHEndpoint
+        }
+        
+        // 建立到 Controller 数据平面的连接
+        if controllerAddr != "" {
+            handleNewTunnel(event.Tunnel, controllerAddr)
+        }
         
     case tunnel.EventTypeDeleted:
         log.Printf("隧道关闭: %s", event.Tunnel.ID)
@@ -2083,23 +2122,43 @@ notifier.Broadcast(tunnelEvent)
 
 ---
 
-### 7.3 TCPProxyServer - TCP 代理服务器
+### 7.3 TCPProxyServer - TCP 单向代理服务器
 
-**功能**: TCP 透明代理（数据平面固定）
+> ⚠️ **使用场景限制**: 此服务器仅适用于 IH/AH 客户端直接连接目标应用的场景（Client → Proxy → Target）  
+> **不适用于**: Controller 数据平面中继（应使用 `TunnelRelayServer`）
+
+**功能**: TCP 单向透明代理，从 TunnelStore 查询目标地址并转发
+
+**适用场景**:
+- ✅ IH Client 本地代理转发到内网目标
+- ✅ AH Agent 接收隧道数据后转发到目标应用
+- ❌ Controller 数据平面（错误：会导致 IH → Controller → Target 的错误流向）
 
 **接口定义**:
 
 ```go
 type TCPProxyServer interface {
+    // Start 启动 TCP 代理监听（不推荐：无 TLS）
+    // Deprecated: Use StartTLS for production
     Start(addr string) error
+    
+    // StartTLS 启动 mTLS TCP 代理监听（推荐）
+    StartTLS(addr string, tlsConfig *tls.Config) error
+    
+    // Stop 停止代理服务器
     Stop() error
+    
+    // HandleConnection 处理单个客户端连接
     HandleConnection(conn net.Conn) error
 }
 ```
 
-**使用示例**:
+**使用示例（IH/AH 客户端场景）**:
 
 ```go
+// 创建隧道存储适配器
+tunnelStore := &MyTunnelStore{} // 实现 transport.TunnelStore 接口
+
 // 创建 TCP 代理服务器
 proxyServer := transport.NewTCPProxyServer(tunnelStore, logger, &transport.TCPProxyConfig{
     BufferSize:     32 * 1024,        // 32KB 缓冲区
@@ -2109,14 +2168,118 @@ proxyServer := transport.NewTCPProxyServer(tunnelStore, logger, &transport.TCPPr
     MaxConnections: 10000,            // 最大10000连接
 })
 
-// 启动代理
-go proxyServer.Start(":9443")
+// 启动代理（带 mTLS）
+tlsConfig := certManager.GetTLSConfig()
+go proxyServer.StartTLS(":9443", tlsConfig)
 
 // 停止代理
 proxyServer.Stop()
 ```
 
+**错误使用示例（Controller 不应使用）**:
+
+```go
+// ❌ 错误：Controller 使用 TCPProxyServer
+// 这会导致 IH → Controller → Target 的错误流向（跳过了 AH）
+controller.dataPlane = transport.NewTCPProxyServer(...) // 不要这样做！
+
+// ✅ 正确：Controller 应使用 TunnelRelayServer
+controller.relayServer = transport.NewTunnelRelayServer(...) // 正确方式
+```
+
 ---
+
+### 7.4 TunnelRelayServer - Controller 数据平面中继服务器
+
+> ✅ **Controller 专用**: 此服务器专为 Controller 数据平面设计，实现 IH ↔ Controller ↔ AH 的双向中继
+
+**功能**: 配对 IH 和 AH 连接，实现零拷贝双向数据转发
+
+**核心特性**:
+- 通过 TunnelID 配对 IH 和 AH 连接
+- 使用 io.Copy 零拷贝双向转发
+- 配对超时自动清理（默认 30 秒）
+- mTLS 强制认证
+- 支持 10,000+ 并发隧道
+
+**接口定义**:
+
+```go
+type TunnelRelayServer interface {
+    // StartTLS 启动 mTLS 监听（强制要求 mTLS）
+    StartTLS(addr string, tlsConfig *tls.Config) error
+    
+    // Stop 停止服务器
+    Stop() error
+    
+    // GetStats 获取统计信息
+    GetStats() *RelayStats
+}
+
+// RelayStats 中继统计信息
+type RelayStats struct {
+    ActiveTunnels      int    // 活跃隧道数
+    PendingConnections int    // 待配对连接数
+    TotalRelayed       uint64 // 总转发字节数
+    ErrorCount         int    // 错误计数
+}
+```
+
+**使用示例（Controller 数据平面）**:
+
+```go
+// 创建 TunnelRelayServer
+relayServer := transport.NewTunnelRelayServer(logger, &transport.TunnelRelayConfig{
+    PairingTimeout: 30 * time.Second,  // 配对超时
+    BufferSize:     32 * 1024,         // 32KB 缓冲区
+    ReadTimeout:    300 * time.Second, // 5分钟读超时
+    WriteTimeout:   300 * time.Second, // 5分钟写超时
+    MaxConnections: 10000,             // 最大并发连接
+})
+
+// 启动中继服务器（强制 mTLS）
+tlsConfig := certManager.GetTLSConfig()
+tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert // 强制客户端证书
+
+go func() {
+    if err := relayServer.StartTLS(":9443", tlsConfig); err != nil {
+        log.Fatalf("Relay server error: %v", err)
+    }
+}()
+
+// 查询统计信息
+stats := relayServer.GetStats()
+log.Printf("Active tunnels: %d, Pending: %d, Total relayed: %d bytes",
+    stats.ActiveTunnels, stats.PendingConnections, stats.TotalRelayed)
+
+// 停止服务器
+relayServer.Stop()
+```
+
+**数据流程说明**:
+
+```
+1. IH Client → Controller:9443 (发送 TunnelID "550e8400-...")
+2. AH Agent → Controller:9443 (发送相同 TunnelID "550e8400-...")
+3. Controller 配对两个连接
+4. Controller 双向转发：
+   - IH 数据 → AH (io.Copy)
+   - AH 数据 → IH (io.Copy)
+```
+
+**与 TCPProxyServer 的对比**:
+
+| 特性 | TCPProxyServer | TunnelRelayServer |
+|------|---------------|-------------------|
+| **使用场景** | IH/AH 客户端 → 目标应用 | Controller 数据平面中继 |
+| **数据流向** | Client → Proxy → Target（单向） | IH ↔ Controller ↔ AH（双向） |
+| **连接配对** | 无需配对 | 通过 TunnelID 配对 |
+| **目标地址** | 从 TunnelStore 查询 | 不查询（直接转发） |
+| **适用组件** | IH Client, AH Agent | Controller |
+
+---
+
+### 7.5 GRPCServer - gRPC 服务器（可选）
 
 ### 7.4 GRPCServer - gRPC 服务器（可选）
 

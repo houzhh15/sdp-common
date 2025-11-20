@@ -1,0 +1,20 @@
+--- a/tunnel_relay_server_test.go
++++ b/tunnel_relay_server_test.go
+@@ -5,6 +5,7 @@ import (
+ "crypto/x509"
+ "io"
+ "log/slog"
++"crypto/x509/pkix"
+ "net"
+ "os"
+ "sync"
+@@ -92,7 +93,7 @@ func newMockTLSConn(initialData []byte, clientCN string) *mockTLSConn {
+ func (m *mockTLSConn) ConnectionState() tls.ConnectionState {
+ 	return tls.ConnectionState{
+ 		HandshakeComplete: true,
+ 		PeerCertificates: []*x509.Certificate{
+- _={Subject: pkixName{CommonName: m.clientCN}},
++{Subject: pkix.Name{CommonName: m.clientCN}},
+ 		},
+ 	}
+ }

@@ -11,6 +11,7 @@ import (
 	"github.com/houzhh15/sdp-common/protocol"
 	"github.com/houzhh15/sdp-common/session"
 	"github.com/houzhh15/sdp-common/tunnel"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // registerHandlers registers all HTTP API handlers
@@ -18,6 +19,9 @@ import (
 func (c *Controller) registerHandlers() {
 	// Health check endpoint
 	c.mux.HandleFunc("/health", c.handleHealth)
+
+	// Metrics endpoint for Prometheus
+	c.mux.Handle("/metrics", promhttp.Handler())
 
 	// Session management endpoints
 	c.mux.HandleFunc("/api/v1/handshake", c.handleHandshake)
@@ -33,6 +37,7 @@ func (c *Controller) registerHandlers() {
 
 	// Tunnel management endpoints
 	c.mux.HandleFunc("/api/v1/tunnels", c.handleTunnels)
+	c.mux.HandleFunc("/api/v1/tunnels/stats", c.handleTunnelStats)
 	c.mux.HandleFunc("/api/v1/tunnels/", c.handleTunnelDelete)
 
 	// SSE subscription endpoints
@@ -315,13 +320,22 @@ func (c *Controller) handleTunnelCreate(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondError(w, "ERROR", "Invalid request body", nil)
+		respondErrorWithStatus(w, "INVALID_REQUEST", "Invalid request body", nil, http.StatusBadRequest)
 		return
 	}
 
+	// Validate session token
 	sess, err := c.sessionManager.ValidateSession(ctx, req.SessionToken)
 	if err != nil {
-		respondError(w, "ERROR", "Invalid or expired session", nil)
+		respondErrorWithStatus(w, "UNAUTHORIZED", "Invalid or expired session", nil, http.StatusUnauthorized)
+		return
+	}
+
+	// Query service configuration to verify service exists
+	_, err = c.tunnelManager.GetServiceConfig(ctx, req.ServiceID)
+	if err != nil {
+		c.logger.Warn("Service not found", "service_id", req.ServiceID, "error", err)
+		respondErrorWithStatus(w, "SERVICE_NOT_FOUND", fmt.Sprintf("Service not found: %s", req.ServiceID), nil, http.StatusNotFound)
 		return
 	}
 
@@ -333,7 +347,7 @@ func (c *Controller) handleTunnelCreate(w http.ResponseWriter, r *http.Request) 
 	})
 	if err != nil || !decision.Allowed {
 		c.logger.Warn("Access denied", "client_id", sess.ClientID, "service_id", req.ServiceID)
-		respondError(w, "POLICY_DENIED", "Access denied by policy", nil)
+		respondErrorWithStatus(w, "POLICY_DENIED", "Access denied by policy", nil, http.StatusForbidden)
 		return
 	}
 
@@ -346,27 +360,38 @@ func (c *Controller) handleTunnelCreate(w http.ResponseWriter, r *http.Request) 
 	})
 	if err != nil {
 		c.logger.Error("Failed to create tunnel", "error", err)
-		respondError(w, "ERROR", "Tunnel creation failed", nil)
+		respondErrorWithStatus(w, "INTERNAL_ERROR", "Tunnel creation failed", nil, http.StatusInternalServerError)
 		return
 	}
 
 	c.logger.Info("Tunnel created", "tunnel_id", tun.ID, "client_id", sess.ClientID)
 
-	// Notify AH agents
+	// Extract controller address (remove https:// prefix if present)
+	controllerAddr := c.config.TCPProxyAddr
+	if controllerAddr[0] == ':' {
+		// If only port is specified, use localhost
+		controllerAddr = "localhost" + controllerAddr
+	}
+
+	// Notify AH agents with controller data plane address
 	event := &tunnel.TunnelEvent{
 		Type:      tunnel.EventTypeCreated,
 		Tunnel:    tun,
 		Timestamp: time.Now(),
+		Details: map[string]interface{}{
+			"controller_addr": controllerAddr, // 添加 Controller 数据平面地址
+		},
 	}
 	c.tunnelNotifier.Notify(event)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"type":      protocol.MsgTypeTunnelResp,
-		"status":    "success",
-		"tunnel_id": tun.ID,
-		"tunnel":    tun,
+		"type":            "tunnel_response",
+		"status":          "success",
+		"tunnel_id":       tun.ID,
+		"controller_addr": controllerAddr,
+		"expires_at":      tun.ExpiresAt.Format(time.RFC3339),
 	})
 }
 
@@ -412,14 +437,75 @@ func (c *Controller) handleTunnelDelete(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+// handleTunnelStats handles GET requests for tunnel statistics
+// Returns active tunnels, pending connections, and total bytes transferred
+func (c *Controller) handleTunnelStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx := r.Context()
+
+	// Verify session token (admin or authenticated user)
+	token := extractBearerToken(r)
+	if token == "" {
+		respondErrorWithStatus(w, "ERROR", "Missing authorization token", nil, http.StatusUnauthorized)
+		return
+	}
+
+	_, err := c.sessionManager.ValidateSession(ctx, token)
+	if err != nil {
+		respondErrorWithStatus(w, "ERROR", "Invalid or expired session", nil, http.StatusUnauthorized)
+		return
+	}
+
+	// Get statistics from relay server
+	stats := c.relayServer.GetStats()
+
+	// Build response with detailed connection breakdown
+	response := map[string]interface{}{
+		"type":                    "tunnel_stats",
+		"status":                  "success",
+		"total_tunnels":           stats.ActiveTunnels,
+		"active_tunnels":          stats.ActiveTunnels,
+		"pending_tunnels":         stats.PendingConnections,
+		"total_bytes_transferred": stats.TotalRelayed,
+		"connections": map[string]interface{}{
+			"pending_ih": stats.PendingIH,
+			"pending_ah": stats.PendingAH,
+		},
+		"error_count": stats.ErrorCount,
+		"timestamp":   time.Now().Format(time.RFC3339),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
+
+	c.logger.Info("Tunnel stats retrieved",
+		"active_tunnels", stats.ActiveTunnels,
+		"pending_connections", stats.PendingConnections,
+		"total_relayed", stats.TotalRelayed)
+}
+
 // handleTunnelEventsSSE handles SSE subscription for tunnel events
+// Supports agent_id and agent_type query parameters as per design doc 3.2.2
 func (c *Controller) handleTunnelEventsSSE(w http.ResponseWriter, r *http.Request) {
 	agentID := r.URL.Query().Get("agent_id")
+	agentType := r.URL.Query().Get("agent_type") // "ih" or "ah"
+
 	if agentID == "" {
 		agentID = "unknown"
 	}
+	if agentType == "" {
+		agentType = "unknown"
+	}
 
-	c.logger.Info("SSE connection request", "agent_id", agentID, "client", r.RemoteAddr)
+	c.logger.Info("SSE connection request",
+		"agent_id", agentID,
+		"agent_type", agentType,
+		"client", r.RemoteAddr)
 
 	if err := c.tunnelNotifier.Subscribe(agentID, w); err != nil {
 		c.logger.Error("Failed to subscribe", "error", err)

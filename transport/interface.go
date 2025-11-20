@@ -30,7 +30,9 @@ type SSEServer interface {
 	Broadcast(event *Event) error
 }
 
-// TCPProxyServer TCP 代理服务器（数据平面固定）
+// TCPProxyServer TCP 代理服务器
+// 使用场景：IH/AH 客户端直接连接目标应用（Client → Proxy → Target）
+// 不适用于 Controller 数据平面中继（应使用 TunnelRelayServer）
 type TCPProxyServer interface {
 	// Start 启动 TCP 代理监听（不推荐：无 TLS）
 	// Deprecated: Use StartTLS for production

@@ -268,15 +268,22 @@ func (a *AHAgent) handleTunnelCreated(event *tunnel.TunnelEvent) {
 		return
 	}
 
-	// Per SDP 2.0: Get TCP Proxy address from tunnel metadata
+	// Get Controller data plane address from event details (highest priority)
 	var proxyAddr string
-	if tun.Metadata != nil {
+	if event.Details != nil {
+		if addr, ok := event.Details["controller_addr"].(string); ok {
+			proxyAddr = addr
+		}
+	}
+
+	// Fallback 1: Get TCP Proxy address from tunnel metadata
+	if proxyAddr == "" && tun.Metadata != nil {
 		if endpoint, ok := tun.Metadata["ah_endpoint"].(string); ok {
 			proxyAddr = endpoint
 		}
 	}
 
-	// Fallback to AHEndpoint if metadata not available
+	// Fallback 2: AHEndpoint if metadata not available
 	if proxyAddr == "" {
 		proxyAddr = tun.AHEndpoint
 	}

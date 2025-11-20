@@ -30,7 +30,23 @@ type TunnelInfo struct {
 }
 
 // tcpProxyServer TCP 代理服务器实现
-// 基于 tunnel.TCPProxy 抽象，约 65% 复用率
+//
+// 使用场景说明：
+//   - ✅ 适用于 IH/AH 客户端直接连接目标应用的场景（Client → TCPProxy → Target）
+//   - ✅ IH Client 本地代理转发到内网目标
+//   - ✅ AH Agent 接收隧道数据后转发到目标应用
+//   - ❌ 不适用于 Controller 数据平面中继（应使用 TunnelRelayServer）
+//
+// 错误使用示例：
+//
+//	Controller 使用 TCPProxyServer 会导致 IH → Controller → Target 的错误流向
+//	正确的 Controller 数据流应该是：IH → Controller → AH → Target（使用 TunnelRelayServer）
+//
+// 正确使用示例：
+//  1. IH Client: 本地应用 → 127.0.0.1:8080(TCPProxy) → Controller:9443
+//  2. AH Agent: Controller:9443 → TCPProxy → 内网应用:80
+//
+// 复用率：约 65%（基于 tunnel.TCPProxy 抽象）
 type tcpProxyServer struct {
 	listener    net.Listener
 	tunnelStore TunnelStore

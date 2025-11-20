@@ -27,12 +27,12 @@ package controller
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -64,8 +64,8 @@ type Controller struct {
 	logger         logging.Logger
 
 	// Transport servers
-	httpServer      transport.HTTPServer
-	dataPlaneServer *tunnel.DataPlaneServer // Use tunnel.DataPlaneServer with mTLS
+	httpServer  transport.HTTPServer
+	relayServer transport.TunnelRelayServer // Controller data plane: IH ↔ Controller ↔ AH
 
 	// Internal state
 	db         *gorm.DB
@@ -153,53 +153,49 @@ func New(cfg *Config) (*Controller, error) {
 	// Initialize HTTP server
 	httpServer := transport.NewHTTPServer(tlsConfig)
 
-	// Create tunnel store adapter for data plane server
-	tunnelStoreAdapter := &TunnelStoreAdapter{manager: tunnelManager}
-
-	// Initialize Data Plane Server with mTLS
-	dataPlaneServer := tunnel.NewDataPlaneServer(&tunnel.DataPlaneServerConfig{
-		Addr:           cfg.TCPProxyAddr,
-		TLSConfig:      tlsConfig, // Enable mTLS
-		Logger:         logger,
-		BufferSize:     32 * 1024,
-		ConnectTimeout: 10 * time.Second,
-		ReadTimeout:    300 * time.Second,
-		WriteTimeout:   300 * time.Second,
-	})
+	// Initialize Tunnel Relay Server for Controller data plane (IH ↔ Controller ↔ AH)
+	// NOTE: Controller should use TunnelRelayServer, NOT TCPProxyServer
+	// TCPProxyServer is for IH/AH clients connecting directly to targets
+	var relayConfig *transport.TunnelRelayConfig
+	if cfg.DataPlane != nil {
+		// Use configuration from config file
+		relayConfig = &transport.TunnelRelayConfig{
+			PairingTimeout: cfg.DataPlane.RelayConfig.PairingTimeout,
+			BufferSize:     cfg.DataPlane.RelayConfig.BufferSize,
+			ReadTimeout:    cfg.DataPlane.RelayConfig.ReadTimeout,
+			WriteTimeout:   cfg.DataPlane.RelayConfig.WriteTimeout,
+			MaxConnections: cfg.DataPlane.RelayConfig.MaxConnections,
+		}
+	} else {
+		// Use default configuration if not specified
+		relayConfig = &transport.TunnelRelayConfig{
+			PairingTimeout: 30 * time.Second,
+			BufferSize:     32 * 1024,
+			ReadTimeout:    300 * time.Second,
+			WriteTimeout:   300 * time.Second,
+			MaxConnections: 10000,
+		}
+	}
+	relayServer := transport.NewTunnelRelayServer(logger, relayConfig)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	c := &Controller{
-		config:          cfg,
-		certManager:     certManager,
-		certRegistry:    certRegistry,
-		sessionManager:  sessionManager,
-		policyEngine:    policyEngine,
-		tunnelManager:   tunnelManager.(*InMemoryTunnelManager),
-		tunnelNotifier:  tunnelNotifier,
-		logger:          logger,
-		httpServer:      httpServer,
-		dataPlaneServer: dataPlaneServer,
-		db:              db,
-		mux:             http.NewServeMux(),
-		ctx:             ctx,
-		cancelFunc:      cancel,
+		config:         cfg,
+		certManager:    certManager,
+		certRegistry:   certRegistry,
+		sessionManager: sessionManager,
+		policyEngine:   policyEngine,
+		tunnelManager:  tunnelManager.(*InMemoryTunnelManager),
+		tunnelNotifier: tunnelNotifier,
+		logger:         logger,
+		httpServer:     httpServer,
+		relayServer:    relayServer,
+		db:             db,
+		mux:            http.NewServeMux(),
+		ctx:            ctx,
+		cancelFunc:     cancel,
 	}
-
-	// Set up data plane connection handler
-	tcpProxyServer := transport.NewTCPProxyServer(
-		tunnelStoreAdapter,
-		logger,
-		&transport.TCPProxyConfig{
-			BufferSize:     32 * 1024,
-			ConnectTimeout: 10 * time.Second,
-			ReadTimeout:    300 * time.Second,
-			WriteTimeout:   300 * time.Second,
-		},
-	)
-	dataPlaneServer.SetHandler(func(conn net.Conn) error {
-		return tcpProxyServer.HandleConnection(conn)
-	})
 
 	// Register HTTP handlers
 	c.registerHandlers()
@@ -243,6 +239,10 @@ func (c *Controller) Stop() error {
 		c.logger.Error("Failed to stop HTTP server", "error", err)
 	}
 
+	if err := c.relayServer.Stop(); err != nil {
+		c.logger.Error("Failed to stop relay server", "error", err)
+	}
+
 	c.logger.Info("Controller stopped")
 	return nil
 }
@@ -266,11 +266,40 @@ func (c *Controller) AddPolicy(pol *policy.Policy) error {
 	return c.policyEngine.SavePolicy(c.ctx, pol)
 }
 
-// startDataPlane starts the data plane server with mTLS
+// startDataPlane starts the tunnel relay server with mTLS
 func (c *Controller) startDataPlane() {
-	c.logger.Info("Starting data plane server with mTLS", "addr", c.config.TCPProxyAddr)
-	if err := c.dataPlaneServer.Start(); err != nil {
-		c.logger.Error("Data plane server error", "error", err)
+	// Determine listen address
+	listenAddr := c.config.TCPProxyAddr
+	if c.config.DataPlane != nil && c.config.DataPlane.ListenAddr != "" {
+		listenAddr = c.config.DataPlane.ListenAddr
+	}
+
+	c.logger.Info("Starting tunnel relay server (data plane) with mTLS", "addr", listenAddr)
+
+	// Get TLS config - use DataPlane config if available, otherwise fallback to default
+	var tlsConfig *tls.Config
+	if c.config.DataPlane != nil {
+		// Load certificates from DataPlane config
+		dataPlaneManager, err := cert.NewManager(&cert.Config{
+			CertFile: c.config.DataPlane.TLS.CertFile,
+			KeyFile:  c.config.DataPlane.TLS.KeyFile,
+			CAFile:   c.config.DataPlane.TLS.CAFile,
+		})
+		if err != nil {
+			c.logger.Error("Failed to load data plane certificates", "error", err)
+			return
+		}
+
+		tlsConfig = dataPlaneManager.GetTLSConfig()
+		// Override client auth mode with DataPlane config
+		tlsConfig.ClientAuth = c.config.DataPlane.TLS.GetClientAuthType()
+	} else {
+		// Fallback to default cert manager
+		tlsConfig = c.certManager.GetTLSConfig()
+	}
+
+	if err := c.relayServer.StartTLS(listenAddr, tlsConfig); err != nil {
+		c.logger.Error("Tunnel relay server error", "error", err)
 	}
 }
 
@@ -310,13 +339,19 @@ func extractBearerToken(r *http.Request) string {
 
 // respondError sends a JSON error response
 func respondError(w http.ResponseWriter, code string, message string, details interface{}) {
+	respondErrorWithStatus(w, code, message, details, http.StatusBadRequest)
+}
+
+func respondErrorWithStatus(w http.ResponseWriter, code string, message string, details interface{}, statusCode int) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusBadRequest)
+	w.WriteHeader(statusCode)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":  "error",
-		"code":    code,
-		"message": message,
-		"details": details,
+		"type":      "error",
+		"status":    "error",
+		"code":      code,
+		"message":   message,
+		"details":   details,
+		"timestamp": time.Now().Format(time.RFC3339),
 	})
 }
 
