@@ -14,6 +14,14 @@
 - [3. session - 会话管理包](#3-session---会话管理包)
 - [4. policy - 策略引擎包](#4-policy---策略引擎包)
 - [5. tunnel - 隧道管理包](#5-tunnel---隧道管理包)
+  - [5.1 Manager - 隧道生命周期管理](#51-manager---隧道生命周期管理)
+  - [5.2 ServiceConfig - 服务配置管理](#52-serviceconfig---服务配置管理)
+  - [5.3 Notifier - 隧道事件通知](#53-notifier---隧道事件通知)
+  - [5.4 Subscriber - SSE 客户端订阅](#54-subscriber---sse-客户端订阅)
+  - [5.5 DataPlaneClient - 数据平面客户端](#55-dataplaneclient---数据平面客户端)
+  - [5.6 TCPProxy - 数据平面透明代理](#56-tcpproxy---数据平面透明代理)
+  - [5.7 Broker - gRPC 流转发](#57-broker---grpc-流转发)
+  - [5.8 EventStore - 事件持久化存储接口](#58-eventstore---事件持久化存储接口)
 - [6. logging - 日志审计包](#6-logging---日志审计包)
 - [7. transport - 传输层包](#7-transport---传输层包)
 - [8. protocol - 协议定义包](#8-protocol---协议定义包)
@@ -1850,6 +1858,392 @@ err = broker.CloseTunnel(tunnelID)
 
 ---
 
+### 5.8 EventStore - 事件持久化存储接口
+
+> **✨ 新增功能** (2025-11-22): 支持 SSE 事件持久化和 Last-Event-ID 重连恢复机制
+
+**功能**: 事件存储接口，用于实现 SSE 断线重连时的事件恢复，支持多种存储实现（Redis Stream、Kafka、PostgreSQL、Memory 等）
+
+**设计理念**:
+- **协议无关**: Event 结构不包含 SSE 特定格式，支持 WebSocket/gRPC 等多种传输协议
+- **存储无关**: 接口不绑定特定存储系统，可灵活切换
+- **零事件丢失**: 通过 Last-Event-ID 机制确保 SSE 重连后能恢复错过的事件
+
+**接口定义**:
+
+```go
+type EventStore interface {
+    // Publish 发布事件到指定订阅者
+    // subscriberID: 订阅者唯一标识（如 agentID）
+    // event: 要发布的事件
+    // 返回: 事件ID（用于 Last-Event-ID），错误
+    Publish(ctx context.Context, subscriberID string, event *Event) (eventID string, err error)
+
+    // Subscribe 订阅事件流（从指定 ID 之后开始）
+    // subscriberID: 订阅者唯一标识
+    // lastEventID: 上次收到的事件 ID，为空表示从最新事件开始
+    // 返回: 事件通道（实时事件流），错误
+    Subscribe(ctx context.Context, subscriberID, lastEventID string) (<-chan *Event, error)
+
+    // GetEventsAfter 获取指定 ID 之后的历史事件（用于重连恢复）
+    // subscriberID: 订阅者唯一标识
+    // lastEventID: 上次收到的事件 ID
+    // limit: 最大返回数量（0 表示使用默认值）
+    // 返回: 历史事件列表，错误
+    GetEventsAfter(ctx context.Context, subscriberID, lastEventID string, limit int) ([]*Event, error)
+
+    // Ack 确认事件已处理（可选，用于消费者组模式）
+    Ack(ctx context.Context, subscriberID, eventID string) error
+
+    // Close 关闭存储连接
+    Close() error
+}
+```
+
+**数据结构**:
+
+```go
+// Event 通用事件结构（协议无关）
+type Event struct {
+    // ID 事件唯一标识（由存储系统生成，如 Redis Stream ID: "1637856000000-0"）
+    ID string `json:"id"`
+
+    // Type 事件类型（tunnel.created, service.updated, policy.changed 等）
+    Type string `json:"type"`
+
+    // Data 事件数据（JSON 格式）
+    Data json.RawMessage `json:"data"`
+
+    // Timestamp 事件时间戳（Unix 毫秒）
+    Timestamp int64 `json:"timestamp"`
+
+    // Metadata 可选的元数据
+    Metadata map[string]string `json:"metadata,omitempty"`
+}
+
+// 标准事件类型常量
+const (
+    EventTypeTunnelCreated  = "tunnel.created"
+    EventTypeTunnelClosed   = "tunnel.closed"
+    EventTypeServiceUpdated = "service.updated"
+    EventTypePolicyChanged  = "policy.changed"
+    EventTypeAgentStatus    = "agent.status"
+)
+
+// TunnelEventData 隧道事件数据结构
+type TunnelEventData struct {
+    Action    string      `json:"action"` // created, closed, updated
+    Tunnel    *TunnelInfo `json:"tunnel"`
+    Timestamp time.Time   `json:"timestamp"`
+}
+
+// TunnelInfo 隧道信息（简化版，避免循环依赖）
+type TunnelInfo struct {
+    ID        string `json:"id"`
+    ClientID  string `json:"client_id"`
+    ServiceID string `json:"service_id"`
+    Status    string `json:"status"`
+}
+
+// ServiceEventData 服务事件数据结构
+type ServiceEventData struct {
+    Action    string                 `json:"action"` // updated, removed
+    ServiceID string                 `json:"service_id"`
+    Config    map[string]interface{} `json:"config"`
+    Timestamp time.Time              `json:"timestamp"`
+}
+```
+
+**辅助函数**:
+
+```go
+// NewEvent 创建新事件（辅助函数）
+func NewEvent(eventType string, data interface{}) (*Event, error) {
+    jsonData, err := json.Marshal(data)
+    if err != nil {
+        return nil, err
+    }
+
+    return &Event{
+        Type:      eventType,
+        Data:      jsonData,
+        Timestamp: time.Now().UnixMilli(),
+        Metadata:  make(map[string]string),
+    }, nil
+}
+
+// ParseData 解析事件数据到目标结构
+func (e *Event) ParseData(v interface{}) error {
+    return json.Unmarshal(e.Data, v)
+}
+```
+
+**实现建议**:
+
+EventStore 是一个接口，需要在项目中实现具体的存储方案：
+
+1. **Redis Stream 实现** (推荐用于生产环境):
+```go
+// internal/event/redis_store.go
+type RedisEventStore struct {
+    rdb          *redis.Client
+    streamPrefix string        // "events:"
+    maxLen       int64         // 1000
+    ttl          time.Duration // 24h
+}
+
+func (s *RedisEventStore) Publish(ctx context.Context, subscriberID string, event *Event) (string, error) {
+    streamKey := s.streamPrefix + subscriberID
+    eventJSON, _ := json.Marshal(event)
+    
+    // 使用 XADD 命令，自动生成 ID（时间戳-序列号格式）
+    result, err := s.rdb.XAdd(ctx, &redis.XAddArgs{
+        Stream: streamKey,
+        MaxLen: s.maxLen,
+        Approx: true,
+        Values: map[string]interface{}{"event": string(eventJSON)},
+    }).Result()
+    
+    return result, err
+}
+```
+
+2. **Memory 实现** (用于测试和开发):
+```go
+// internal/event/memory_store.go
+type MemoryEventStore struct {
+    streams   map[string][]*Event // subscriberID -> events
+    mu        sync.RWMutex
+    maxEvents int // 1000
+}
+
+func (s *MemoryEventStore) Publish(ctx context.Context, subscriberID string, event *Event) (string, error) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    
+    eventID := fmt.Sprintf("%d-%d", time.Now().UnixMilli(), rand.Int63())
+    event.ID = eventID
+    
+    if _, exists := s.streams[subscriberID]; !exists {
+        s.streams[subscriberID] = make([]*Event, 0, s.maxEvents)
+    }
+    
+    s.streams[subscriberID] = append(s.streams[subscriberID], event)
+    
+    // 限制最大长度
+    if len(s.streams[subscriberID]) > s.maxEvents {
+        s.streams[subscriberID] = s.streams[subscriberID][1:]
+    }
+    
+    return eventID, nil
+}
+```
+
+**使用示例 - Controller 端 (发布事件)**:
+
+```go
+import (
+    "context"
+    "github.com/houzhh15/sdp-common/tunnel"
+    "github.com/houzhh15/sdp-common/logging"
+)
+
+// 1. 创建 EventStore 实现（假设在 internal/event 包中）
+eventStore := event.NewRedisEventStore(&event.RedisEventStoreConfig{
+    RedisClient:  redisClient,
+    Logger:       logger,
+    StreamPrefix: "events:",
+    MaxLen:       1000,
+    TTL:          24 * time.Hour,
+})
+
+// 2. 创建事件管理器（可选的便捷层）
+type EventManager struct {
+    store  tunnel.EventStore
+    logger logging.Logger
+}
+
+func (m *EventManager) PublishTunnelCreated(ctx context.Context, agentID, tunnelID, serviceID string) (string, error) {
+    event, err := tunnel.NewEvent(tunnel.EventTypeTunnelCreated, &tunnel.TunnelEventData{
+        Action: "created",
+        Tunnel: &tunnel.TunnelInfo{
+            ID:        tunnelID,
+            ServiceID: serviceID,
+            Status:    "active",
+        },
+    })
+    if err != nil {
+        return "", err
+    }
+    
+    return m.store.Publish(ctx, agentID, event)
+}
+
+// 3. 在隧道创建业务逻辑中发布事件
+eventID, err := eventManager.PublishTunnelCreated(ctx, "ah-agent-001", "tunnel-123", "postgres-db")
+if err != nil {
+    logger.Error("Failed to publish event", "error", err)
+    // 可选：降级到旧的内存 SSE 方式
+}
+
+logger.Info("Event published", "event_id", eventID, "agent_id", "ah-agent-001")
+```
+
+**使用示例 - Controller 端 (SSE Handler 集成)**:
+
+```go
+// SSE Handler 支持 Last-Event-ID 重连恢复
+func (h *Handler) SSEEventsHandler(c *gin.Context) {
+    agentID := c.Query("agent_id")
+    lastEventID := c.Request.Header.Get("Last-Event-ID")
+    
+    // 设置 SSE headers
+    c.Header("Content-Type", "text/event-stream")
+    c.Header("Cache-Control", "no-cache")
+    c.Header("Connection", "keep-alive")
+    
+    flusher := c.Writer.(http.Flusher)
+    
+    // 1. 推送历史事件（如果有 Last-Event-ID）
+    if lastEventID != "" {
+        missedEvents, err := h.eventStore.GetEventsAfter(
+            c.Request.Context(),
+            agentID,
+            lastEventID,
+            100, // 最多 100 条
+        )
+        
+        if err == nil {
+            h.logger.Info("Pushing missed events",
+                "agent_id", agentID,
+                "last_event_id", lastEventID,
+                "count", len(missedEvents))
+            
+            for _, event := range missedEvents {
+                fmt.Fprintf(c.Writer, "id: %s\n", event.ID)
+                fmt.Fprintf(c.Writer, "event: %s\n", event.Type)
+                fmt.Fprintf(c.Writer, "data: %s\n\n", string(event.Data))
+                flusher.Flush()
+            }
+        }
+    }
+    
+    // 2. 订阅实时事件流
+    eventCh, err := h.eventStore.Subscribe(
+        c.Request.Context(),
+        agentID,
+        lastEventID,
+    )
+    if err != nil {
+        c.String(500, "Subscribe failed: %v", err)
+        return
+    }
+    
+    // 3. 推送实时事件
+    for event := range eventCh {
+        fmt.Fprintf(c.Writer, "id: %s\n", event.ID)
+        fmt.Fprintf(c.Writer, "event: %s\n", event.Type)
+        fmt.Fprintf(c.Writer, "data: %s\n\n", string(event.Data))
+        flusher.Flush()
+    }
+}
+```
+
+**使用示例 - AH Agent 端 (客户端追踪事件 ID)**:
+
+```go
+// AH Agent 的 Agent 结构体
+type Agent struct {
+    lastEventID   string
+    eventIDMutex  sync.RWMutex
+    eventCache    *lru.Cache // 事件去重缓存
+    // ... 其他字段
+}
+
+// SSE 客户端重连时发送 Last-Event-ID
+func (a *Agent) connectSSE() error {
+    url := fmt.Sprintf("%s/api/v1/events?agent_id=%s", a.controllerURL, a.agentID)
+    req, _ := http.NewRequest("GET", url, nil)
+    
+    // 读取最后的事件 ID
+    a.eventIDMutex.RLock()
+    if a.lastEventID != "" {
+        req.Header.Set("Last-Event-ID", a.lastEventID)
+        a.logger.Info("Reconnecting with last event ID", "last_event_id", a.lastEventID)
+    }
+    a.eventIDMutex.RUnlock()
+    
+    resp, err := a.httpClient.Do(req)
+    if err != nil {
+        return err
+    }
+    
+    // 处理 SSE 事件流
+    go a.handleSSEEvents(resp.Body)
+    return nil
+}
+
+// 处理接收到的事件
+func (a *Agent) handleSSEEvent(event *tunnel.Event) {
+    // 事件去重检查
+    if a.eventCache.Contains(event.ID) {
+        a.logger.Debug("Duplicate event, skipping", "event_id", event.ID)
+        return
+    }
+    a.eventCache.Add(event.ID, true)
+    
+    // 保存事件 ID
+    a.eventIDMutex.Lock()
+    a.lastEventID = event.ID
+    a.eventIDMutex.Unlock()
+    
+    // 处理事件
+    switch event.Type {
+    case tunnel.EventTypeTunnelCreated:
+        var tunnelData tunnel.TunnelEventData
+        if err := event.ParseData(&tunnelData); err == nil {
+            a.createTunnel(tunnelData.Tunnel)
+        }
+    case tunnel.EventTypeServiceUpdated:
+        var serviceData tunnel.ServiceEventData
+        if err := event.ParseData(&serviceData); err == nil {
+            a.updateService(serviceData.ServiceID, serviceData.Config)
+        }
+    }
+}
+```
+
+**性能考虑**:
+
+| 存储实现 | 写入延迟 | 查询延迟 | 内存占用 | 适用场景 |
+|---------|---------|---------|---------|---------|
+| Redis Stream | < 5ms | < 10ms | 低（自动删除旧事件） | 生产环境 |
+| Kafka | < 10ms | < 20ms | 中 | 高吞吐量场景 |
+| PostgreSQL | < 50ms | < 100ms | 高 | 需要复杂查询 |
+| Memory | < 1ms | < 1ms | 高（无持久化） | 开发/测试 |
+
+**架构演进**:
+
+EventStore 接口设计支持未来的协议演进：
+
+```
+Phase 1: SSE + EventStore（当前）
+         SSE Handler 使用 EventStore 实现持久化
+
+Phase 2: WebSocket + EventStore
+         WebSocket Handler 复用相同的 EventStore
+
+Phase 3: gRPC Stream + EventStore
+         gRPC Service 复用相同的 EventStore
+```
+
+**相关文档**:
+- [SSE 标准 (RFC 6455)](https://html.spec.whatwg.org/multipage/server-sent-events.html)
+- [Redis Stream 文档](https://redis.io/docs/data-types/streams/)
+- 项目文档: `docs/EVENT_MANAGEMENT_ARCHITECTURE.md`
+
+---
+
 ## 6. logging - 日志审计包
 
 ### 6.1 Logger - 日志记录器接口
@@ -2822,6 +3216,8 @@ $ rm sdp.db
 | | `Subscriber` | `Start()`, `Stop()`, `Events()` | SSE 订阅客户端 |
 | | `TCPProxy` | `HandleIHConnection()`, `HandleAHConnection()`, `GetActiveTunnels()` | TCP 透明代理 |
 | | `Broker` | `RegisterEndpoint()`, `ForwardData()` | gRPC 流转发 |
+| | `EventStore` | `Publish()`, `Subscribe()`, `GetEventsAfter()`, `Ack()`, `Close()` | 事件持久化存储 |
+| | `Event` | `NewEvent()`, `ParseData()` | 通用事件结构 |
 | **logging** | `Logger` | `Info()`, `Warn()`, `Error()`, `Debug()` | 日志记录 |
 | | `AuditLogger` | `LogAccess()`, `LogConnection()`, `LogSecurity()` | 审计日志 |
 | **transport** | `HTTPServer` | `Start()`, `Stop()`, `RegisterMiddleware()` | HTTP 服务器 |
@@ -2999,9 +3395,13 @@ for event := range subscriber.Events() {
 | mTLS | Mutual TLS，双向 TLS 认证 |
 | OCSP | Online Certificate Status Protocol，在线证书状态协议 |
 | SSE | Server-Sent Events，服务器推送事件 |
+| Last-Event-ID | SSE 标准头部字段，用于断线重连时恢复事件流 |
+| Event Store | 事件存储，持久化事件用于重连恢复和审计 |
+| Redis Stream | Redis 5.0+ 新增的流式数据结构，用于消息队列和事件存储 |
 
 ---
 
-**文档版本**: v1.0  
-**最后更新**: 2025-11-16  
+**文档版本**: v1.1  
+**最后更新**: 2025-11-22  
+**更新内容**: 新增 EventStore 事件持久化存储接口（5.8 节）  
 **维护者**: SDP 开发团队

@@ -95,17 +95,24 @@ func (n *Notifier) Subscribe(agentID string, w http.ResponseWriter) error {
 		select {
 		case <-ticker.C:
 			// 发送心跳
+			n.logger.Debug("Sending heartbeat", "agent_id", agentID)
 			fmt.Fprintf(w, ": ping\n\n")
 			flusher.Flush()
 			client.LastPing = time.Now()
 
 		case event := <-client.TunnelChannel:
 			// 发送隧道事件
+			n.logger.Info("Dequeued tunnel event from channel, sending to SSE",
+				"agent_id", agentID,
+				"tunnel_id", event.Tunnel.ID,
+				"event_type", event.Type)
+
 			// Note: SSE event type must be "tunnel" for Subscriber compatibility
 			if err := n.sendTunnelEvent(w, flusher, event); err != nil {
 				n.logger.Error("Failed to send tunnel event", "agent_id", agentID, "error", err)
 				return err
 			}
+			n.logger.Info("Tunnel event sent successfully via SSE", "agent_id", agentID, "tunnel_id", event.Tunnel.ID)
 
 		case event := <-client.ServiceChannel:
 			// 发送服务配置事件
@@ -239,24 +246,36 @@ func (n *Notifier) NotifyOne(agentID string, event *TunnelEvent) error {
 		event.Timestamp = time.Now()
 	}
 
+	n.logger.Debug("NotifyOne called", "agent_id", agentID, "tunnel_id", event.Tunnel.ID)
+
 	value, ok := n.clients.Load(agentID)
 	if !ok {
+		n.logger.Warn("Client not found in clients map", "agent_id", agentID)
 		return fmt.Errorf("client not found: %s", agentID)
 	}
 
 	client := value.(*SSEClient)
+	n.logger.Debug("Client found, attempting to send to channel",
+		"agent_id", agentID,
+		"channel_cap", cap(client.TunnelChannel),
+		"channel_len", len(client.TunnelChannel))
 
 	select {
 	case client.TunnelChannel <- event:
-		n.logger.Debug("Tunnel event sent to client",
+		n.logger.Info("Tunnel event queued in channel",
 			"agent_id", agentID,
 			"event_type", event.Type,
 			"tunnel_id", event.Tunnel.ID,
 		)
 		return nil
 	case <-client.Done:
+		n.logger.Warn("Client disconnected while sending", "agent_id", agentID)
 		return fmt.Errorf("client disconnected: %s", agentID)
 	default:
+		n.logger.Error("Client tunnel channel full",
+			"agent_id", agentID,
+			"channel_cap", cap(client.TunnelChannel),
+			"channel_len", len(client.TunnelChannel))
 		return fmt.Errorf("client tunnel channel full: %s", agentID)
 	}
 }

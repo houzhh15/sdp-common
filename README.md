@@ -6,17 +6,6 @@
 
 通用的 Software-Defined Perimeter (SDP) 2.0 公共库，为 Controller、Initiating Host (IH) 和 Accepting Host (AH) 提供标准化的核心功能实现。
 
-## 📋 目录
-
-- [项目简介](#项目简介)
-- [架构决策](#架构决策)
-- [快速开始](#快速开始)
-- [核心功能](#核心功能)
-- [性能指标](#性能指标)
-- [使用示例](#使用示例)
-- [贡献指南](#贡献指南)
-- [许可证](#许可证)
-
 ## 🎯 项目简介
 
 `sdp-common` 是一个基于 **SDP 2.0 规范**的 Golang 公共库，提供了以下核心能力：
@@ -32,29 +21,11 @@
 ### 设计原则
 
 1. **架构合理性优先**: 混合架构，默认使用 HTTP+SSE+TCP（易用性），可选 gRPC（高性能）
-2. **性能与灵活性平衡**: 数据平面使用 TCP Proxy（协议无关，零拷贝），控制平面支持双协议
+2. **性能与灵活性平衡**: Controller 数据平面使用 TunnelRelayServer（IH↔AH 配对中继），IH/AH 客户端使用 TCP Proxy（本地代理），控制平面支持 HTTP/gRPC 双协议
 3. **接口标准化**: 统一 Controller、IH、AH 的接口定义
 4. **模块化设计**: 各模块高内聚低耦合，支持独立使用
 
-## 🏗️ 架构决策
-
-### 混合架构设计
-
-基于性能测试和实际需求，`sdp-common` 采用**混合协议架构**：
-
-| 层级 | 默认协议 | 可选协议 | 特点 |
-|------|---------|---------|------|
-| **控制平面** | HTTP REST | gRPC | 简单易调试，标准工具支持 |
-| **实时通知** | SSE | gRPC Stream | 浏览器原生支持，\u003c100ms 延迟 |
-| **数据平面** | TCP Proxy | - | 协议无关，零拷贝，950 Mbps 吞吐 |
-
-**关键决策依据**:
-- TCP Proxy 比 gRPC Stream **快 18%** (950 Mbps vs 780 Mbps)
-- SSE 支持所有浏览器，无需额外依赖
-- HTTP REST 可用 `curl` 调试，开发友好
-- 配置驱动，运行时切换协议（无需重编译）
-
-详见 [ARCHITECTURE.md](ARCHITECTURE.md) 和 `docs/architecture-decision-analysis.md`
+详见 `docs/architecture-decision-analysis.md`
 
 ## 🚀 快速开始
 
@@ -291,27 +262,37 @@ auditLogger.LogAccess(ctx, \u0026logging.AccessEvent{
 ### 6. transport - 传输层抽象
 
 **核心接口**:
-- `HTTPServer`: HTTP/REST API 服务器
-- `SSEServer`: SSE 推送服务器
-- `TCPProxyServer`: TCP 代理服务器
+- `HTTPServer`: HTTP/REST API 服务器（控制平面）
+- `SSEServer`: SSE 推送服务器（实时通知）
+- `TunnelRelayServer`: Controller 数据平面中继服务器
+- `TCPProxyServer`: IH/AH 客户端代理服务器
 - `GRPCServer`: gRPC 服务器（可选）
+
+**使用场景说明**:
+- **TunnelRelayServer**: Controller 中继 IH↔AH 连接（双向配对转发）
+- **TCPProxyServer**: IH/AH 客户端直接连接目标应用（单向代理）
 
 **使用示例**:
 ```go
-// HTTP 服务器（控制平面）
-httpServer := transport.NewHTTPServer(tlsConfig)
-httpServer.Start(":8080", handler)
+// Controller: TunnelRelayServer（数据平面中继）
+relayServer := transport.NewTunnelRelayServer(logger, &transport.TunnelRelayConfig{
+    PairingTimeout: 30 * time.Second,
+    BufferSize:     32 * 1024,
+    MaxConnections: 10000,
+})
+tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+go relayServer.StartTLS(":9443", tlsConfig)
+
+// IH Client: TCPProxyServer（本地代理）
+tcpProxy := transport.NewTCPProxyServer(tunnelStore, logger, nil)
+go tcpProxy.StartTLS("127.0.0.1:8080", tlsConfig)
 
 // SSE 服务器（实时通知）
 sseServer := transport.NewSSEServer()
 http.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
-    clientID := r.Header.Get("X-Client-ID")
-    sseServer.Subscribe(clientID, w)
+    agentID := r.URL.Query().Get("agent_id")
+    sseServer.Subscribe(agentID, w)
 })
-
-// TCP Proxy（数据平面）
-tcpProxy := transport.NewTCPProxyServer(tunnelStore)
-tcpProxy.Start(":9443")
 ```
 
 详见 [transport/README.md](transport/README.md)
@@ -348,19 +329,18 @@ if err := loader.Validate(cfg); err != nil {
 
 | 指标 | 数值 | 备注 |
 |------|------|------|
-| **并发连接** | 1000+ | 单 Controller 实例 |
+| **并发连接** | 10,000+ | 单 Controller 实例 |
 | **握手延迟** | \u003c 100ms | P99，包含证书验证 |
 | **会话创建** | \u003c 5ms | P99 |
 | **策略评估** | \u003c 10ms | P99，简单条件 |
-| **数据平面延迟** | \u003c 10ms | P99，TCP Proxy |
-| **TCP Proxy 吞吐** | 950 Mbps | 零拷贝优化 |
+| **隧道配对延迟** | \u003c 10ms | P99，TunnelRelayServer |
 | **SSE 推送延迟** | \u003c 100ms | 事件到达时间 |
 | **内存占用** | ~200MB | Controller + 1000 会话 |
 
-**性能对比**（数据平面）:
-- TCP Proxy: **950 Mbps** ⚡
-- gRPC Stream: 780 Mbps
-- **性能提升**: **+18%**
+**性能特点**:
+- **TunnelRelayServer**: 零拷贝双向转发
+- **配对超时**: 30秒可配置，自动清理过期连接
+- **并发支持**: 10,000+ 并发隧道
 
 详细性能测试报告参见 [test/benchmark_test.go](test/benchmark_test.go)
 
@@ -436,34 +416,42 @@ func main() {
     policyEvaluator := \u0026policy.DefaultEvaluator{}
     policyEngine := policy.NewEngine(policyStorage, policyEvaluator, logger)
     
-    // 8. 初始化隧道管理
-    tunnelStore := tunnel.NewTunnelStore()
-    notifier := tunnel.NewNotifier(logger)
+    // 8. 初始化隧道存储
+    tunnelStore := tunnel.NewMemoryStore()
     
-    // 9. 初始化 HTTP 服务器
-    httpServer := transport.NewHTTPServer(certMgr.GetTLSConfig())
-    
-    // 10. 注册 HTTP 路由
-    http.HandleFunc("/health", healthHandler)
-    http.HandleFunc("/api/v1/handshake", handshakeHandler(sessMgr, certRegistry, auditLogger))
-    http.HandleFunc("/api/v1/tunnels/subscribe", func(w http.ResponseWriter, r *http.Request) {
-        agentID := r.Header.Get("X-Agent-ID")
-        notifier.Subscribe(agentID, w)
+    // 9. 初始化 TunnelRelayServer（数据平面中继）
+    relayServer := transport.NewTunnelRelayServer(logger, &transport.TunnelRelayConfig{
+        PairingTimeout: 30 * time.Second,
+        BufferSize:     32 * 1024,
+        MaxConnections: 10000,
     })
     
-    // 11. 启动 TCP Proxy（数据平面）
-    tcpProxy := tunnel.NewTCPProxy(tunnelStore, logger)
+    // 10. 初始化 SSE 服务器（实时通知）
+    sseServer := transport.NewSSEServer()
+    
+    // 11. 初始化 HTTP 服务器
+    httpServer := transport.NewHTTPServer(certMgr.GetTLSConfig())
+    
+    // 12. 注册 HTTP 路由
+    http.HandleFunc("/health", healthHandler)
+    http.HandleFunc("/api/v1/handshake", handshakeHandler(sessMgr, certRegistry, auditLogger))
+    http.HandleFunc("/api/v1/tunnels", tunnelCreateHandler(tunnelStore, policyEngine, sseServer))
+    http.HandleFunc("/api/v1/tunnels/stream", func(w http.ResponseWriter, r *http.Request) {
+        agentID := r.URL.Query().Get("agent_id")
+        sseServer.Subscribe(agentID, w)
+    })
+    
+    // 13. 启动 TunnelRelayServer（数据平面）
+    tlsConfig := certMgr.GetTLSConfig()
+    tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
     go func() {
-        if err := tcpProxy.Start(":9443"); err != nil {
-            logger.Error("TCP Proxy 启动失败", err, nil)
+        if err := relayServer.StartTLS(":9443", tlsConfig); err != nil {
+            logger.Error("TunnelRelayServer 启动失败", "error", err.Error())
         }
     }()
     
-    // 12. 启动 HTTP 服务器
-    logger.Info("Controller 启动", map[string]interface{}{
-        "http_addr": ":8080",
-        "tcp_proxy": ":9443",
-    })
+    // 14. 启动 HTTP 服务器
+    logger.Info("Controller 启动", "http_addr", ":8080", "relay_addr", ":9443")
     
     if err := httpServer.Start(":8080", nil); err != nil {
         log.Fatalf("HTTP 服务器启动失败: %v", err)
@@ -473,17 +461,6 @@ func main() {
 
 完整示例代码参见 [examples/controller/main.go](examples/controller/main.go)
 
-## 🤝 贡献指南
-
-我们欢迎各种形式的贡献！
-
-### 贡献流程
-
-1. Fork 本仓库
-2. 创建特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 开启 Pull Request
 
 ### 开发要求
 
@@ -509,7 +486,5 @@ go test ./test -bench=. -benchmem
 
 本项目采用 [Apache License 2.0](LICENSE) 许可证。
 
-## 📚 相关文档
 
-- [SDP 2.0 规范](https://cloudsecurityalliance.org/artifacts/software-defined-perimeter-v2/)
 
